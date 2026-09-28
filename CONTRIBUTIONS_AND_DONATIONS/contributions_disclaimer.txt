@@ -1,0 +1,16 @@
+This is a disclaimer on what contributors should and should not expect, rules and guidelines regarding what can be contributed, and information regarding what gets merged to the main system.
+
+EXPECTATIONS
+Contributors can expect the following:
+  - Rights to their contributed code
+  - A place in CREDITS.txt, in order of contribution number and value
+  - Contributors who contribute a lot of content have the option of putting their donation locations in the donations.yml file
+RULES
+Contributors must follow these guidelines when contributing code:
+  - No hate speech, comments, text, et cetera
+  - No curses or strong words
+  - No intentional bugs or viruses hidden in the code
+MERGES
+There is no guarantee that any contributor's work will be merged to the main script. If a script is merged to the main program, it must be significantly better than the previous edition, more popular than the previous edition, or more readable than the previous edition. 
+It must be understood that any contributed code can be merged with or removed from the main branch at the Owner's (galarkingplays) or an admin's discretion.
+If code is merged with or removed from the main branch, credit and a reason will be given. If the contributor does not feel the reason is just, they may request a meeting with the Owner or the admin that made the change. 
