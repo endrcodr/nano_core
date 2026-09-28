@@ -1,5 +1,20 @@
+# Sponsorship IDs here:
 thanks_dev: gh/galarkingplays
-# Anyone who commits at minimum 5 times, 250 or more lines of non-AI generated code,
-# or has successfully fixed 2 major bugs and 5 minor bugs can put their sponsorship IDs here.
-# THIS IS NOT OBLIGATORY, NOR IS IT IN ANY WAY PAYMENT FOR THE PROGRAM. This is so people who have commited reasonable amounts to the Nano project can be supported by users, 
-# should the user desire to do so.
+
+# Disclaimer:
+# VOLUNTARY DONATIONS ONLY
+# This file recognizes contributors who have made significant voluntary contributions
+# to the Nano project and wish to receive support from users who appreciate their work.
+#
+# IMPORTANT: Inclusion here does NOT represent payment for this software. The Nano project
+# is licensed under GPL 3.0 and is provided freely to all users. This sponsorship list is
+# ENTIRELY VOLUNTARY and OPTIONAL.
+#
+# Contributors eligible to add their sponsorship IDs:
+# - Have made 5+ commits with meaningful contributions
+# - Contributed 250+ lines of original (non-AI-generated) code
+# - Successfully fixed 2+ major bugs and 5+ minor bugs
+#
+# Users may choose to support these contributors through voluntary donations if they wish,
+# but such donations are completely optional and do NOT affect access to or use of the
+# Nano software in any way.
