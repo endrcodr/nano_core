@@ -2,15 +2,19 @@ This is a disclaimer on what contributors should and should not expect, rules an
 
 EXPECTATIONS
 Contributors can expect the following:
-  - Rights to their contributed code
-  - A place in CREDITS.txt, in order of contribution number and value
-  - Contributors who contribute a lot of content have the option of putting their donation locations in the donations.yml file
+  - Contributors retain copyright in their original contributions.
+    * By submitting their contributions, they license said contributions under GPLv3 unless otherwise stated.
+    * Work may be brought in from other projects licensed under GPLv3, GPLv2, other GPL licenses, CC0, and other licenses (with creator permission as required). In this case, credit will be given and the original creator(s) will be notified. 
+    * Resubmission of third-party code can only be done by those who have the right or proper permission to do so, and must include the original license and attribution for the code when doing so.
+  - Contributors may be acknowledged in CREDITS.txt based on contribution quality and significance.
+  - Substantial contributors have the option of putting their donation links in the donations.yml file under the guidelines found after the links.
 RULES
 Contributors must follow these guidelines when contributing code:
-  - No hate speech, comments, text, et cetera
-  - No curses or strong words
-  - No intentional bugs or viruses hidden in the code
+  - No hate speech, abusive language, or offensive comments
+  - No profanity or inflammatory content
+  - No intentional bugs, malware, or malicious code
 MERGES
-There is no guarantee that any contributor's work will be merged to the main script. If a script is merged to the main program, it must be significantly better than the previous edition, more popular than the previous edition, or more readable than the previous edition. 
-It must be understood that any contributed code can be merged with or removed from the main branch at the Owner's (galarkingplays) or an admin's discretion.
-If code is merged with or removed from the main branch, credit and a reason will be given. If the contributor does not feel the reason is just, they may request a meeting with the Owner or the admin that made the change. 
+There is no guarantee that any contributor's work will be merged into the main project. If code is merged or removed from the main branch, the owner or project admin may do so at their discretion.
+Credit and a reason will be provided when practical. If a contributor believes a decision was unfair, they may request a meeting with the owner or an admin.
+
+By submitting code to this project, contributors confirm that they have the right to submit that code and agree that their contribution may be used, modified, distributed, and copied under the GNU General Public License v3.0 (GPLv3).
