@@ -1,12 +1,7 @@
-This is a disclaimer for the Nano project, posted under the GNU Public License V3.0. 
+This is a disclaimer for the Nano project, which is licensed under the GNU General Public License v3.0 (GPLv3). The full license text is provided in the LICENSE file.
 
-Contributors are to post updated code to a branch of the project, and the code will be merged to the main branch if it is proven to work as intended, expand on current
-code in a meaningful way, or add a feature deemed useful the community. 
+Contributors may submit updated code through a branch or pull request. Maintainers may merge contributions that work as intended, meaningfully improve the project, or add features useful to the community. More information about contributing code and donations can be found in the CONTRIBUTIONS_AND_DONATIONS directory.
 
-Contributors agree for their code to be used, distributed, modified, and copied under the governance of the GNU Public License Version 3.0. 
+By submitting a contribution, contributors agree to license their contributions under the GNU General Public License v3.0. Contributors confirm that they have the right to submit the code and to license it under GPLv3.
 
-No reuse of code contained in this project for the purposes of a codebase or software under a license other than the GNU Public License Version 3.0 is allowed.
-No redistribution of the code contained in this project for the purpose of any form of profit is allowed in any form.
-
-Contributors understand that they may not expect any form of payment for their contributed code, and any payments made to contributors must be in the form of willing
-donations to those who have contributed significantly to the project.
+Contributors are not entitled to payment or other compensation from the Nano project for their contributions. Donations to contributors may be made voluntarily through the DONATE.yml file in the CONTRIBUTIONS_AND_DONATIONS directory. Donations are optional and do not alter the licensing terms of the code.
