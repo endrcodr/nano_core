@@ -1,0 +1,12 @@
+This is a disclaimer for the Nano project, posted under the GNU Public License V3.0. 
+
+Contributors are to post updated code to a branch of the project, and the code will be merged to the main branch if it is proven to work as intended, expand on current
+code in a meaningful way, or add a feature deemed useful the community. 
+
+Contributors agree for their code to be used, distributed, modified, and copied under the governance of the GNU Public License Version 3.0. 
+
+No reuse of code contained in this project for the purposes of a codebase or software under a license other than the GNU Public License Version 3.0 is allowed.
+No redistribution of the code contained in this project for the purpose of any form of profit is allowed in any form.
+
+Contributors understand that they may not expect any form of payment for their contributed code, and any payments made to contributors must be in the form of willing
+donations to those who have contributed significantly to the project.
