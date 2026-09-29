@@ -1,0 +1,4 @@
+Download VSCode or another similar text editor.  
+Open the 'example.n' script in the text editor.
+Continue to the end of the 'example.n' script.
+Once that's done, you're all set to start coding in Nano! 
