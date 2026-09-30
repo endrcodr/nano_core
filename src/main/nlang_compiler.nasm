@@ -5,6 +5,7 @@ compile:
     mov ah, 0x0
     mov bx, 0x0
     mov rdi, 0x0
+    mov r14, 0x0
 
 ; From this point on is the compiler for the code.
 ; The functions are as follows:
@@ -57,7 +58,8 @@ compile:
     jae .end_of_file
     
     mov al, [rsi]
-
+.in_comment:
+    cmp ax
 .var_detect:
     ; Variable detection logic
     ; Since variables can be named with any character, we first need to check the current token to see if it is a variable or a function. We start by checking the characters of the token to see if it matches any variable names, and if it does, we assume it is a variable. One exception to this rule is if the variable name is the same as a function name, in which case we cross-check it to see if that line has a function already in use. If so, we assume the token to be a variable, and if not, we assume it to be a function. In the case a variable is named the same as a function, we look at the context to determine the meaning. For example, use the term 'if if == 0'. As the function 'if' is already in use, we know that the second 'if' is the variable, assuming 'if' is a valid variable. However, in the term 'if = 0', we can see that the term 'if' is using the incorrect syntax for a function, and we assume it is a variable if it is a valid variable. It it is not a valid variable, we assume it is a function and give the user an 'invalid syntax' error.
@@ -136,9 +138,9 @@ compile:
     cmp al, 'u'
     je .until_func
     cmp al, 'f'
-    je .for_func
+    je .f_func
     cmp al, 'v'
-    je .var_func
+    je .var_func_det
     cmp al, 'b'
     je .bool_func
     cmp al, 'd'
@@ -147,21 +149,76 @@ compile:
     je .import_func
     cmp al, 'm'
     je .mem_func
-    cmp al, 's'
-    je .fs_func
-.elif_else_func:
+.f_func:
+    cmp byte [rsi + 1], 'o'
+    jne .fs_func_det
+    cmp byte [rsi + 2], 'r'
+    jne .incomplete_for_func
+    jmp .for_func
+.fs_func_det:
+    cmp byte [rsi + 1], 's'
+    jne .incomplete_f_func
+    jmp .fs_func
+.elif_else_func_det:
     cmp byte [rsi + 1], 'l'
-
+    jne .incomplete_el_func
     cmp byte [rsi + 2], 'i'
-
+    jne .else_func_det
     cmp byte [rsi + 3], 'f'
-  
+    jne .incomplete_elif_func
     jmp .elif_func
+.else_func_det:
+    cmp byte [rsi + 2], 's'
+    jne .incomplete_el_func
+    cmp byte [rsi + 3], 'e'
+    jne .incomplete_else_func
+    jmp .else_func
+.var_func_det:
+    cmp byte [rsi + 1], 'a'
+    jne .incomplete_var_func
+    cmp byte [rsi + 2], 'r'
+    jne .incomplete_var_func
+    cmp byte [rsi + 3], ' '
+    jne .invalid_var_func_sntx
+    jmp .var_func
 .next_char:
     inc rsi
     jmp .func_logic
 .standard_compile:
-    mov bx, 0xFEED
+    ; Standart compilation flag setup
 .shell_compile:
-    mov bx, 0xAFFE
+    ; Shell compilation flag setup
+.core_compile:
+    ; Core compilation flag setup
 .end_of_file:
+    ; End of file reached. Compilation complete.
+.incomplete_el_func:
+    mov bx, 0x0000
+    jmp error
+.incomplete_elif_func:
+    mov bx, 0x0001
+    jmp error
+.incomplete_else_func:
+    mov bx, 0x0002
+    jmp error
+.incomplete_for_func:
+    mov bx, 0x0003
+    jmp error
+.incomplete_f_func:
+    mov bx, 0x0004
+    jmp error
+.invalid_var_func_sntx:
+    mov bx, 0x0005
+    jmp error
+.comment:
+    mov r14, 0x0000
+    jmp .next_char
+.if_func:
+    mov r14, 0x0001
+    jmp .next_char
+.elif_func:
+    mov r14, 0x0002
+    jmp .next_char
+.else_func:
+    mov r14, 0x0003
+    jmp .next_char
