@@ -58,8 +58,18 @@ compile:
     jae .end_of_file
     
     mov al, [rsi]
-.in_comment:
-    cmp ax
+    cmp al, 0xA
+    je .newline
+    cmp r14, 0x0001
+    je .next_char
+    jmp .var_detect
+.newline:
+    cmp r14, 0x0001
+    je .clear_flag_cmmt
+    ; Honestly I'm pretty sure newlines clear all flags EXCEPT triple hash, which triggers a multiline comment. That's the only one I think.
+.clear_flag_cmmt:
+    mov r14, 0x0000
+
 .var_detect:
     ; Variable detection logic
     ; Since variables can be named with any character, we first need to check the current token to see if it is a variable or a function. We start by checking the characters of the token to see if it matches any variable names, and if it does, we assume it is a variable. One exception to this rule is if the variable name is the same as a function name, in which case we cross-check it to see if that line has a function already in use. If so, we assume the token to be a variable, and if not, we assume it to be a function. In the case a variable is named the same as a function, we look at the context to determine the meaning. For example, use the term 'if if == 0'. As the function 'if' is already in use, we know that the second 'if' is the variable, assuming 'if' is a valid variable. However, in the term 'if = 0', we can see that the term 'if' is using the incorrect syntax for a function, and we assume it is a variable if it is a valid variable. It it is not a valid variable, we assume it is a function and give the user an 'invalid syntax' error.
@@ -211,14 +221,14 @@ compile:
     mov bx, 0x0005
     jmp error
 .comment:
-    mov r14, 0x0000
-    jmp .next_char
-.if_func:
     mov r14, 0x0001
     jmp .next_char
-.elif_func:
+.if_func:
     mov r14, 0x0002
     jmp .next_char
-.else_func:
+.elif_func:
     mov r14, 0x0003
+    jmp .next_char
+.else_func:
+    mov r14, 0x0004
     jmp .next_char
