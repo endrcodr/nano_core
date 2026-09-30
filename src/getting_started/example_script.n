@@ -1,0 +1,22 @@
+# \    /  |--- |     /--\  /--\   |\    /| |---- ||
+#  | | |  |--  |     |     |  |   | \  / | |---  ||
+#  \/ \/  |--- |___  \__/  \__/   |  \/  | |---- ()
+
+# Welcome to Nano. Nano is a human-readable coding language built on Python. It is designed to be easy to learn and use, and it is also designed to be efficient and fast.
+# To start: Install the Nano extension (VS Code only) and correct the lines below:
+
+var int 'x' == 'hi'
+var int y = 15 * x
+var str z = noquotes
+var srt w = 'why is this not closed?
+var str v = 'hello# friendly greeting #!'
+var str u = 'this sentence is very long and it will not fit in a normal string variable'
+
+# Great job! Now, fix the syntax error in the following if/elif/else statement:
+
+if x == 1234567
+    # Don't forget :
+elif y * x >= 12345:
+    # Why can't you see that times?
+els:
+    # E n cn spl
