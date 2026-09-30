@@ -1,0 +1,3 @@
+*.n linguist-language=Nano
+*.ns linguist-language=NanoSource
+*.nc linguist-language=Nano
