@@ -14,9 +14,21 @@ var str u = 'this sentence is very long and it will not fit in a normal string v
 
 # Great job! Now, fix the syntax error in the following if/elif/else statement:
 
-if x == 1234567
-    # Don't forget :
-elif y * x >= 12345:
-    # Why can't you see that times?
-els:
-    # E n cn spl
+if x == 1234567:
+    # Fires as long as x is currently 1234567
+elif y >= 12345:
+    # Elif logic, fires if y is greater than or equal to 12,345, as long as x is not equal to 1,234,567.
+else:
+    # Else logic, fires whenever the above if and elif requirements are not met.
+
+# Logic is next: It's important to remember that, unlike languages like Python, boolean values cannot be nested (e.g. x = 1 or y = 2) in if functions and therefore require logic to be completed in steps using the bool function.
+
+bool x == 14 or x == 13 # Outputs 1 if x is either 13 or 14. Otherwise it outputs 0. The output is a variable called 'bool.out', or simply '.out' in other bool functions.
+bool .out and y == 2 # Outputs 1 if bool.out (defined in the previous function, translatable to "x is either 13 or 14") is true (or 1), and y is equal to 2.
+bool .out xor n >= 17 # Outputs 1 to bool.out if bool.out is 1 (which would mean that x is 13 or 14 and y is 2) or n is greater than or equal to 17, but not if both conditions are true.
+bool .out nand not n < 18 # Outputs  to bool.out only if bool.out is 1 and n is not less than (or greater than or equal to) 18.
+# The final result of this is only 1 (aka True) if:
+# - x is 13 or 14
+# - y is 2
+# - n is less than 18 but greater than or equal to 17
+# Or if any one of the outputs is false, except the last one.
