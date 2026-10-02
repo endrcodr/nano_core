@@ -1,3 +1,9 @@
+section .data
+    nlang_writer db 'nlang_writer.nasm'
+section .text
+
+%include nlang_writer
+
 compile:
     mov rsi, buffer
     mov rdx, [bytes_read]
@@ -61,15 +67,40 @@ compile:
     cmp al, 0xA
     je .newline
     cmp r14, 0x0001
-    je .next_char
+    je .cmmt_flag0
+    cmp r14, 0xFFFE
+    je .cmmt_flag1
+    cmp r14, 0xFFFF
+    je .check_val
     jmp .var_detect
 .newline:
-    cmp r14, 0x0001
-    je .clear_flag_cmmt
-    ; Honestly I'm pretty sure newlines clear all flags EXCEPT triple hash, which triggers a multiline comment. That's the only one I think.
-.clear_flag_cmmt:
+    cmp r14, 0xFFFF
+    jne .clear_flag
+.clear_flag:
     mov r14, 0x0000
-
+.check_val:
+    cmp al, '#'
+    je .lcmmt_clear_det0
+    cmp r14, 0xFFFD
+    je .lcmmt_clear_flag_clear
+.lcmmt_clear_det0:
+    cmp r14, 0xFFFF
+    jne .lcmmt_clear_det1
+    mov r14, 0xFFFD
+    jmp .lcmmt_clear_flag_clear
+.lcmmt_clear_det1:
+    cmp r14, 0xFFFD
+    jne .lcmmt_clear_det2
+    mov r14, 0xFFFC
+    jmp .lcmmt_clear_flag_clear
+.lcmmt_clear_det2:
+    cmp r14, 0xFFFC
+    jne .lcmmt_clear_flag_clear
+    mov r14, 0x0000
+    jmp .next_char
+.lcmmt_clear_flag_clear:
+    mov r14, 0xFFFF
+    jmp .next_char
 .var_detect:
     ; Variable detection logic
     ; Since variables can be named with any character, we first need to check the current token to see if it is a variable or a function. We start by checking the characters of the token to see if it matches any variable names, and if it does, we assume it is a variable. One exception to this rule is if the variable name is the same as a function name, in which case we cross-check it to see if that line has a function already in use. If so, we assume the token to be a variable, and if not, we assume it to be a function. In the case a variable is named the same as a function, we look at the context to determine the meaning. For example, use the term 'if if == 0'. As the function 'if' is already in use, we know that the second 'if' is the variable, assuming 'if' is a valid variable. However, in the term 'if = 0', we can see that the term 'if' is using the incorrect syntax for a function, and we assume it is a variable if it is a valid variable. It it is not a valid variable, we assume it is a function and give the user an 'invalid syntax' error.
@@ -88,7 +119,11 @@ compile:
     mov ah, [0xF000]
     cmp ah, 0
     je .func_detect
-    mov r8, ah ; Faster to copy the number of variables to a register than to reread it from RAM.
+    push rcx
+    mov cl, ah
+    movzx cx, cl
+    mov r8, rcx
+    pop rcx ; This function could have been simply a 'movzx r8, ah', but unfortunately that doesn't work with x86-64 CPUs. Therefore, I must first free up a 64-bit register, like RCX, by pushing it into the stack, zero-extending AH into RCX, copying RCX into R8, then popping the top item off the stack back into RCX, restoring the original value.
     mov r9, 1 ; Used for looping through variables. Starts at 1, as the number of variables starts at 1, and the number and counter are more easily read if they line up at 0.
     mov rdi, 0x1
     movzx rcx, byte [0xF000 + rdi]
@@ -160,36 +195,51 @@ compile:
     cmp al, 'm'
     je .mem_func
 .f_func:
-    cmp byte [rsi + 1], 'o'
+    inc rsi
+    cmp byte [rsi], 'o'
     jne .fs_func_det
-    cmp byte [rsi + 2], 'r'
+    inc rsi
+    cmp byte [rsi], 'r'
     jne .incomplete_for_func
+    inc rsi
     jmp .for_func
 .fs_func_det:
-    cmp byte [rsi + 1], 's'
+    inc rsi
+    cmp byte [rsi], 's'
     jne .incomplete_f_func
+    inc rsi
     jmp .fs_func
 .elif_else_func_det:
-    cmp byte [rsi + 1], 'l'
+    inc rsi
+    cmp byte [rsi], 'l'
     jne .incomplete_el_func
-    cmp byte [rsi + 2], 'i'
+    inc rsi
+    cmp byte [rsi], 'i'
     jne .else_func_det
-    cmp byte [rsi + 3], 'f'
+    inc rsi
+    cmp byte [rsi], 'f'
     jne .incomplete_elif_func
     jmp .elif_func
 .else_func_det:
-    cmp byte [rsi + 2], 's'
+    inc rsi
+    cmp byte [rsi], 's'
     jne .incomplete_el_func
-    cmp byte [rsi + 3], 'e'
+    inc rsi
+    cmp byte [rsi], 'e'
     jne .incomplete_else_func
+    inc rsi
     jmp .else_func
 .var_func_det:
-    cmp byte [rsi + 1], 'a'
+    inc rsi
+    cmp byte [rsi], 'a'
     jne .incomplete_var_func
-    cmp byte [rsi + 2], 'r'
+    inc rsi
+    cmp byte [rsi], 'r'
     jne .incomplete_var_func
-    cmp byte [rsi + 3], ' '
+    inc rsi
+    cmp byte [rsi], ' '
     jne .invalid_var_func_sntx
+    inc rsi
     jmp .var_func
 .next_char:
     inc rsi
@@ -202,6 +252,19 @@ compile:
     ; Core compilation flag setup
 .end_of_file:
     ; End of file reached. Compilation complete.
+.cmmt_flag0:
+    cmp al, '#'
+    jne .next_char
+    mov r14, 0xFFFE
+    jmp .next_char
+.cmmt_flag1:
+    cmp al, '#'
+    jne .cmmt_flag_cancel
+    mov r14, 0xFFFF
+    jmp .next_char
+.cmmt_flag_cancel:
+    mov r14, 0x0000
+    jmp .next_char
 .incomplete_el_func:
     mov bx, 0x0000
     jmp error
@@ -223,6 +286,9 @@ compile:
 .comment:
     mov r14, 0x0001
     jmp .next_char
+.mline_comment:
+    mov r14, 0xFFFF
+    jmp .next_char
 .if_func:
     mov r14, 0x0002
     jmp .next_char
@@ -232,3 +298,52 @@ compile:
 .else_func:
     mov r14, 0x0004
     jmp .next_char
+.var_func:
+    mov r14, 0x0005 ; Setup variable function flags
+    jmp .next_char
+; Now that we've set up the appropriate flags, we can start feeding the values to the writer to write the function to NASM Assembly.
+
+.write_current_func:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp r14, 0x0005
+    je .write_var_def_findvals
+    jmp .decode_current_func
+.call_write_func:
+    call write_func
+    jmp .retrieve_stored_registers
+.call_write_var:
+    call write_var
+    jmp .retrieve_stored_registers
+.decode_current_func:
+.write_var_def_findvals:
+    
+.retrieve_stored_registers:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax

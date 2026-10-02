@@ -1,15 +1,12 @@
-# nlang_main.nasm
-section .data
-    nlang_opener db 'nlang_opener.nasm', 0
-    nlang_compiler db 'nlang_compiler.nasm', 0
-
+bits 64
+default rel
 section .text
 global main
 main:
     ; Include nlang_opener.nasm
-    incbin nlang_opener
+    %include "nlang_opener.nasm"
     ; Include nlang_compiler.nasm
-    incbin nlang_compiler
+    %include "nlang_compiler.nasm"
 
     ; Call the main function from nlang_opener.nasm
     call main_opener
