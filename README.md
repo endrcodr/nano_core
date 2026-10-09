@@ -8,4 +8,4 @@ Once you're familiar with Python, open '1. Get Started.txt' and 'example_script.
 NASM assembler, and a computer runningWindows 11. We are currently working on a Linux port, and hope to soon come out with our own OS with this compiler built-in.
 
 # NOTICE: 
-Nano is currently not yet at a phase where the compiler is functional. This initial public release is not a functional prototype, just a concept requiring refinement. Anyone willing to contribute is strongly encouraged to do so, and examples of what different lines of code will compile to can be found in /src/developer_concepts/compile_goals.txt and desired optimizations can be found at /src/developer_concepts/possible_optimizations.txt.
+Nano is currently not yet at a phase where the compiler is functional. This initial public release is not a functional prototype, just a concept requiring refinement. Anyone willing to contribute is strongly encouraged to do so. Examples of what code will compile to will soon be available.
