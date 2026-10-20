@@ -5,7 +5,9 @@ Start by learning the basics of Python. This language was built primarily on the
 Once you're familiar with Python, open '1. Get Started.txt' and 'example_script.n' in the 'src/getting_started' directory
 
 # Requirements:
-NASM assembler, and a computer runningWindows 11. We are currently working on a Linux port, and hope to soon come out with our own OS with this compiler built-in.
+NASM assembler, and a computer running Windows 11. We are currently working on a Linux port, and hope to soon come out with our own OS with this compiler built-in.
 
 # NOTICE: 
 Nano is currently not yet at a phase where the compiler is functional. This initial public release is not a functional prototype, just a concept requiring refinement. Anyone willing to contribute is strongly encouraged to do so. Examples of what code will compile to will soon be available.
+
+*The code for the Nano Project has been coded for humans, by humans. Suggestions containing AI-generated, convoluted, obfuscated, or otherwise hidden or overly complex code will not be considered for the main branch.*
