@@ -10,4 +10,4 @@ NASM assembler, and a computer running Windows 11. We are currently working on a
 # NOTICE: 
 Nano is currently not yet at a phase where the compiler is functional. This initial public release is not a functional prototype, just a concept requiring refinement. Anyone willing to contribute is strongly encouraged to do so. Examples of what code will compile to will soon be available.
 
-*The code for the Nano Project has been coded for humans, by humans. Suggestions containing AI-generated, convoluted, obfuscated, or otherwise hidden or overly complex code will not be considered for the main branch.*
+*The code for the Nano Project has been coded for humans, by humans. Suggestions containing convoluted, obfuscated, or otherwise hidden or overly complex code will not be considered for the main branch. AI-generated code is not allowed unless tested and reviewed by an experienced human.*
