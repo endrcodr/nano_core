@@ -1,17 +1,83 @@
+; nlang_compiler.nasm - front end of the Nano compiler.
+; Included by nlang_main.nasm AFTER nlang_opener.nasm (needs `buffer` and `bytes_read`).
+;
+; Calling convention: compile takes no args, returns EAX = 0 on success, and
+; preserves the Windows non-volatile registers. Compile errors jump to `error`,
+; which exits the process with code 0x100 + BX.
+bits 64
+default rel
+
+extern ExitProcess
+
+; ---- statement flags kept in R14 (0 = start of a statement) -----------------
+FN_NONE   equ 0
+FN_IF     equ 2
+FN_ELIF   equ 3
+FN_ELSE   equ 4
+FN_VAR    equ 5
+FN_WHILE  equ 6
+FN_UNTIL  equ 7
+FN_FOR    equ 8
+FN_BOOL   equ 9
+FN_DEF    equ 10
+FN_IMPORT equ 11
+FN_MEM    equ 12
+FN_FS     equ 13
+FN_TVAR   equ 14                ; like FN_VAR, but the variable is temporary
+
+; ---- variable type byte -----------------------------------------------------
+VAR_TEMP      equ 0x80          ; bit 7 set = temporary (tvar), removed by purge_tvars
+VAR_TYPE_MASK equ 0x7F          ; low bits: 0 = num, 1 = str, 2 = lstr
+
+; ---- comment state kept in R13 ----------------------------------------------
+CMT_NONE  equ 0
+CMT_LINE  equ 1                 ; '#'   -> until end of line
+CMT_BLOCK equ 2                 ; '###' -> until the next '###'
+
+; ---- error codes (loaded into BX before `jmp error`) ------------------------
+ERR_INVALID_VAR_SYNTAX equ 5    ; 'var' not followed by a space
+ERR_UNTERMINATED_CMT   equ 6    ; '###' never closed
+ERR_NAME_TOO_LONG      equ 7    ; identifier longer than 255 (length is stored in 1 byte)
+
+VAR_TABLE_SIZE equ 0x10000
+
+section .bss
+    ; Variable table. This used to live at the absolute address 0xF000, which is
+    ; inside the 64 KiB null-guard region of a Windows process -> instant access
+    ; violation on first use. Layout is unchanged:
+    ;   [0]            number of variables (1 byte)
+    ;   per variable:  [len][type][name * len][value...]
+    ;   type byte: bit 7 (VAR_TEMP) marks a temporary variable (tvar), the low
+    ;              bits (VAR_TYPE_MASK) are the type below
+    ;   type 0 = number : 8-byte value
+    ;   type 1 = string : 8-byte value (max 8 characters)
+    ;   type 2 = lstring: 8-byte big-endian length, then that many payload bytes
+    var_table resb VAR_TABLE_SIZE
+
 section .data
-    nlang_writer db 'nlang_writer.nasm'
+; keyword table: [len][name][dw flag] ... terminated by a zero length byte
+%macro KW 2
+    db %%end - %%start
+%%start: db %1
+%%end:   dw %2
+%endmacro
+
+kw_table:
+    KW "if",     FN_IF
+    KW "elif",   FN_ELIF
+    KW "else",   FN_ELSE
+    KW "var",    FN_VAR
+    KW "tvar",   FN_TVAR
+    KW "while",  FN_WHILE
+    KW "until",  FN_UNTIL
+    KW "for",    FN_FOR
+    KW "bool",   FN_BOOL
+    KW "def",    FN_DEF
+    KW "import", FN_IMPORT
+    db 0
+; "mem." and "fs." families are matched by prefix in match_keyword.
+
 section .text
-
-%include nlang_writer
-
-compile:
-    mov rsi, buffer
-    mov rdx, [bytes_read]
-    add rdx, rsi
-    mov ah, 0x0
-    mov bx, 0x0
-    mov rdi, 0x0
-    mov r14, 0x0
 
 ; From this point on is the compiler for the code.
 ; The functions are as follows:
@@ -22,6 +88,7 @@ compile:
 ; until ### % ###: - Loop that continues until a contition is met
 ; for @ = *: - Loop that continues until a value, here represented as an @, is equal to a number, represented as an *.
 ; var num/str/lstr @@@ [= *] - Defines a variable. Its name is represented here as '@@@', and the brackets show an optional way of defining the variable immediately. Otherwise, the variable is initialized to 0 or '0'. Num sets the variable type to a number. Str sets the variable type to a string, at most 8 characters. Lstr sets the variable type to a long string, using RAM space to store the value. Lstr variables are slower, but can contain much more data at once.
+; tvar num/str/lstr @@@ [= *] - Defines a temporary variable. Its name is represented here as '@@@', and the brackets show an optional way of defining the variable immediately. Otherwise, the variable is initialized to 0 or '0'. Num sets the variable type to a number. Str sets the variable type to a string, at most 8 characters. Lstr sets the variable type to a long string, using RAM space to store the value. Lstr variables are slower, but can contain much more data at once. Temporary variables only exist in the compiled variable table for the duration of the active function, script, or function.
 ; # - Used to mark a comment. Single hashes mean one line, every character of text after that point. Triple hashes mean a multi-line comment, which continues until the next triple hash.
 ; bool ### % ### - used to compute boolean functions seperately, used when defining a variable's value. The result is stored in the variable, and can be used later in the code.
 ; def @@@ (args): - Defines a function. The name is represented here as '@@@', and arguments, however many are needed, are represented as 'args'. The function is called by using the name of the function, and passing in the arguments. The function can return a value, which can be used in the code.
@@ -59,251 +126,353 @@ compile:
 ; fs.setowner @@@, * - Sets the owner of a file or directory with the name represented here as '@@@' to the value represented here as '*'.
 ; fs.getsecure @@@ - Gets the security status of a file or directory with the name represented here as '@@@' and returns it.
 ; fs.setsecure @@@, * - Sets the security status of a file or directory with the name represented here as '@@@' to the value represented here as '*'.
-.func_logic:
-    cmp rsi, rdx
-    jae .end_of_file
-    
-    mov al, [rsi]
-    cmp al, 0xA
-    je .newline
-    cmp r14, 0x0001
-    je .cmmt_flag0
-    cmp r14, 0xFFFE
-    je .cmmt_flag1
-    cmp r14, 0xFFFF
-    je .check_val
-    jmp .var_detect
-.newline:
-    cmp r14, 0xFFFF
-    jne .clear_flag
-.clear_flag:
-    mov r14, 0x0000
-.check_val:
-    cmp al, '#'
-    je .lcmmt_clear_det0
-    cmp r14, 0xFFFD
-    je .lcmmt_clear_flag_clear
-.lcmmt_clear_det0:
-    cmp r14, 0xFFFF
-    jne .lcmmt_clear_det1
-    mov r14, 0xFFFD
-    jmp .lcmmt_clear_flag_clear
-.lcmmt_clear_det1:
-    cmp r14, 0xFFFD
-    jne .lcmmt_clear_det2
-    mov r14, 0xFFFC
-    jmp .lcmmt_clear_flag_clear
-.lcmmt_clear_det2:
-    cmp r14, 0xFFFC
-    jne .lcmmt_clear_flag_clear
-    mov r14, 0x0000
-    jmp .next_char
-.lcmmt_clear_flag_clear:
-    mov r14, 0xFFFF
-    jmp .next_char
-.var_detect:
-    ; Variable detection logic
-    ; Since variables can be named with any character, we first need to check the current token to see if it is a variable or a function. We start by checking the characters of the token to see if it matches any variable names, and if it does, we assume it is a variable. One exception to this rule is if the variable name is the same as a function name, in which case we cross-check it to see if that line has a function already in use. If so, we assume the token to be a variable, and if not, we assume it to be a function. In the case a variable is named the same as a function, we look at the context to determine the meaning. For example, use the term 'if if == 0'. As the function 'if' is already in use, we know that the second 'if' is the variable, assuming 'if' is a valid variable. However, in the term 'if = 0', we can see that the term 'if' is using the incorrect syntax for a function, and we assume it is a variable if it is a valid variable. It it is not a valid variable, we assume it is a function and give the user an 'invalid syntax' error.
-    ; Variables are defined in a table at the location 0xF000 in RAM. This address shows the number of variables defined. The variable's type, represented as a '0' for a number, '1' for a string, and '2' for a long string, is next. The following address is the length of the variable name, followed by the name itself. The type of the variable changes what the next byte means; for a number, the next 8 bytes are the number's value. For a standard string, the next 8 bytes are the string's value. For a long string, the next 8 bytes are the length of the string, followed by the string's value. 
-    ; For example, a number variable named 'myVar' with the value of 123 would be formatted as this: 
-    ; [0xF000] = 1 (number of variables)
-    ; The following bytes are repeated per-variable:
-    ; [0xF001] = 5 (length of variable name)
-    ; [0xF002] = 0 (type of variable, 0 for number, 1 for string, 2 for long string)
-    ; [0xF003] = 'm'
-    ; [0xF004] = 'y'
-    ; [0xF005] = 'V'
-    ; [0xF006] = 'a'
-    ; [0xF007] = 'r'
-    ; [0xF008] through [0xF015] = 123 (value of myVar, 8 bytes)
-    mov ah, [0xF000]
-    cmp ah, 0
-    je .func_detect
-    push rcx
-    mov cl, ah
-    movzx cx, cl
-    mov r8, rcx
-    pop rcx ; This function could have been simply a 'movzx r8, ah', but unfortunately that doesn't work with x86-64 CPUs. Therefore, I must first free up a 64-bit register, like RCX, by pushing it into the stack, zero-extending AH into RCX, copying RCX into R8, then popping the top item off the stack back into RCX, restoring the original value.
-    mov r9, 1 ; Used for looping through variables. Starts at 1, as the number of variables starts at 1, and the number and counter are more easily read if they line up at 0.
-    mov rdi, 0x1
-    movzx rcx, byte [0xF000 + rdi]
-    inc rdi
-    movzx r10, byte [0xF000 + rdi]
-    inc rdi
-    cmp byte [0xF000 + rdi], al
-    je .var_found
-    cmp r8, r9 
-    jne .next_var ; Used for looping through variables.
-    jmp .func_detect ; If we have looped through all the variables and not found a match, we assume it is a function.
-.next_var:
-    inc r9
-    add rdi, rcx
-    cmp r10, 2 ; If the variable is a long string, we need to read the 8-byte length field byte-by-byte, then skip the value bytes.
-    je .long_string_length
-    add rdi, 8 ; Skip the fixed-size value of the variable, as we don't need to check it.
-    jmp .check_next_var
-.long_string_length:
-    xor r11, r11 ; Clear the accumulator used for the long-string length.
-    xor r12, r12 ; Clear the byte counter for the length field.
-.long_string_length_loop:
-    movzx r13, byte [0xF000 + rdi]
-    shl r11, 8
-    or r11, r13
-    inc rdi
-    inc r12
-    cmp r12, 8
-    jb .long_string_length_loop
-    add rdi, r11 ; Skip the long-string payload using the decoded length.
-    jmp .check_next_var
-.check_next_var:
-    movzx rcx, byte [0xF000 + rdi]
-    inc rdi
-    movzx r10, byte [0xF000 + rdi]
-    inc rdi
-    cmp byte [0xF000 + rdi], al
-    je .var_found
-    cmp r8, r9
-    jne .next_var
-    jmp .func_detect
-.var_found:
-    ; This could be a variable, but it could also be a function with the same first letter. We need to check the next digits to see if the token's value matches this variable's name. If so, we cross-check with active flags (0x0000 for a newline, 0x0001:0x02C for functions, etc.) to see if a function is in use. If so, we scan through the rest of the line to see if the line contains the correct syntax for the function. If not, we throw an error. If so, we write the code for retrieving the variable's value from the RAM, and substitute it in.
-    dec rdi
-    mov ah, [0xF000 + rdi]
-    inc rdi
-    cmp [0xF000 + rdi], al
-.func_detect:
-    cmp al, '#'
-    je .comment
-    cmp al, 'i'
-    je .if_func
-    cmp al, 'e'
-    je .elif_else_func
-    cmp al, 'w'
-    je .while_func
-    cmp al, 'u'
-    je .until_func
-    cmp al, 'f'
-    je .f_func
-    cmp al, 'v'
-    je .var_func_det
-    cmp al, 'b'
-    je .bool_func
-    cmp al, 'd'
-    je .def_func
-    cmp al, 'i'
-    je .import_func
-    cmp al, 'm'
-    je .mem_func
-.f_func:
-    inc rsi
-    cmp byte [rsi], 'o'
-    jne .fs_func_det
-    inc rsi
-    cmp byte [rsi], 'r'
-    jne .incomplete_for_func
-    inc rsi
-    jmp .for_func
-.fs_func_det:
-    inc rsi
-    cmp byte [rsi], 's'
-    jne .incomplete_f_func
-    inc rsi
-    jmp .fs_func
-.elif_else_func_det:
-    inc rsi
-    cmp byte [rsi], 'l'
-    jne .incomplete_el_func
-    inc rsi
-    cmp byte [rsi], 'i'
-    jne .else_func_det
-    inc rsi
-    cmp byte [rsi], 'f'
-    jne .incomplete_elif_func
-    jmp .elif_func
-.else_func_det:
-    inc rsi
-    cmp byte [rsi], 's'
-    jne .incomplete_el_func
-    inc rsi
-    cmp byte [rsi], 'e'
-    jne .incomplete_else_func
-    inc rsi
-    jmp .else_func
-.var_func_det:
-    inc rsi
-    cmp byte [rsi], 'a'
-    jne .incomplete_var_func
-    inc rsi
-    cmp byte [rsi], 'r'
-    jne .incomplete_var_func
-    inc rsi
-    cmp byte [rsi], ' '
-    jne .invalid_var_func_sntx
-    inc rsi
-    jmp .var_func
-.next_char:
-    inc rsi
-    jmp .func_logic
-.standard_compile:
-    ; Standart compilation flag setup
-.shell_compile:
-    ; Shell compilation flag setup
-.core_compile:
-    ; Core compilation flag setup
-.end_of_file:
-    ; End of file reached. Compilation complete.
-.cmmt_flag0:
-    cmp al, '#'
-    jne .next_char
-    mov r14, 0xFFFE
-    jmp .next_char
-.cmmt_flag1:
-    cmp al, '#'
-    jne .cmmt_flag_cancel
-    mov r14, 0xFFFF
-    jmp .next_char
-.cmmt_flag_cancel:
-    mov r14, 0x0000
-    jmp .next_char
-.incomplete_el_func:
-    mov bx, 0x0000
-    jmp error
-.incomplete_elif_func:
-    mov bx, 0x0001
-    jmp error
-.incomplete_else_func:
-    mov bx, 0x0002
-    jmp error
-.incomplete_for_func:
-    mov bx, 0x0003
-    jmp error
-.incomplete_f_func:
-    mov bx, 0x0004
-    jmp error
-.invalid_var_func_sntx:
-    mov bx, 0x0005
-    jmp error
-.comment:
-    mov r14, 0x0001
-    jmp .next_char
-.mline_comment:
-    mov r14, 0xFFFF
-    jmp .next_char
-.if_func:
-    mov r14, 0x0002
-    jmp .next_char
-.elif_func:
-    mov r14, 0x0003
-    jmp .next_char
-.else_func:
-    mov r14, 0x0004
-    jmp .next_char
-.var_func:
-    mov r14, 0x0005 ; Setup variable function flags
-    jmp .next_char
-; Now that we've set up the appropriate flags, we can start feeding the values to the writer to write the function to NASM Assembly.
 
-.write_current_func:
+; Register plan inside compile (all Windows non-volatile, so they survive calls):
+;   rsi = cursor        r12 = end of input     r13 = comment state
+;   r14 = statement flag (FN_*)                r15 = base of var_table
+;   rdi = start of the current token, rbx = error code
+compile:
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 32                ; shadow space; 7 pushes + 32 keeps rsp 16-byte aligned
+
+    lea  rsi, [buffer]
+    mov  r12, [bytes_read]
+    add  r12, rsi
+    lea  r15, [var_table]
+    xor  r13d, r13d
+    xor  r14d, r14d
+    xor  ebx, ebx
+
+.func_logic:
+    cmp  rsi, r12
+    jae  .end_of_file
+    movzx eax, byte [rsi]
+
+    cmp  r13d, CMT_LINE
+    je   .in_line_comment
+    cmp  r13d, CMT_BLOCK
+    je   .in_block_comment
+
+    cmp  al, '#'
+    je   .comment_start
+    cmp  al, 0x0A
+    je   .newline
+    cmp  al, ' '
+    je   .next_char
+    cmp  al, 0x09
+    je   .next_char
+    cmp  al, 0x0D
+    je   .next_char
+
+    call ident_char             ; eax = 1 if this starts a token
+    test eax, eax
+    jnz  .token
+    ; Operators, quotes, brackets...: not handled yet (TODO), just skip them.
+
+.next_char:
+    inc  rsi
+    jmp  .func_logic
+
+.newline:
+    xor  r14d, r14d             ; a statement ends at the end of its line
+    jmp  .next_char
+
+; ---- comments ---------------------------------------------------------------
+; The old state machine overwrote its own flag on every newline (all paths ended
+; in `mov r14, 0xFFFF`), so everything after the first newline was treated as an
+; endless multi-line comment, and any '#' inside a '#' comment ended it early.
+.comment_start:
+    mov  r13d, CMT_LINE
+    lea  rcx, [rsi + 3]
+    cmp  rcx, r12
+    ja   .next_char
+    cmp  byte [rsi + 1], '#'
+    jne  .next_char
+    cmp  byte [rsi + 2], '#'
+    jne  .next_char
+    mov  r13d, CMT_BLOCK
+    add  rsi, 3
+    jmp  .func_logic
+
+.in_line_comment:
+    cmp  al, 0x0A
+    jne  .next_char
+    xor  r13d, r13d
+    jmp  .newline
+
+.in_block_comment:
+    cmp  al, '#'
+    jne  .next_char
+    lea  rcx, [rsi + 3]
+    cmp  rcx, r12
+    ja   .next_char
+    cmp  byte [rsi + 1], '#'
+    jne  .next_char
+    cmp  byte [rsi + 2], '#'
+    jne  .next_char
+    xor  r13d, r13d
+    add  rsi, 3
+    jmp  .func_logic
+
+; ---- tokens -----------------------------------------------------------------
+; Detection used to run per CHARACTER with first-letter dispatch ('i' -> if, 'e'
+; -> else, ...), which mis-detects any identifier and skipped a character when
+; testing "fs"/"else". Now a whole token is scanned, then matched.
+.token:
+    mov  rdi, rsi
+.tok_loop:
+    inc  rsi
+    cmp  rsi, r12
+    jae  .tok_done
+    movzx eax, byte [rsi]
+    call ident_char
+    test eax, eax
+    jnz  .tok_loop
+.tok_done:
+    mov  rcx, rsi
+    sub  rcx, rdi               ; token length, rsi is just past the token
+
+    movzx eax, byte [rdi]
+    sub  eax, '0'
+    cmp  eax, 9
+    jbe  .func_logic            ; numeric literal (TODO: emit constants)
+    cmp  rcx, 255
+    ja   .err_name_too_long
+
+    test r14d, r14d
+    jnz  .as_variable           ; mid-statement: keywords are only variables here
+    call match_keyword
+    test eax, eax
+    jz   .as_variable
+    mov  r14d, eax
+    cmp  eax, FN_VAR
+    je   .need_space
+    cmp  eax, FN_TVAR
+    jne  .func_logic
+.need_space:
+    cmp  byte [rsi], ' '        ; 'var' / 'tvar' must be followed by a space
+    jne  .err_invalid_var
+    jmp  .func_logic
+
+.as_variable:
+    call find_var               ; rax = record or 0
+    test rax, rax
+    jz   .func_logic            ; TODO: unknown name -> new variable / function call / syntax error
+    ; TODO: emit a load of the variable through the writer
+    jmp  .func_logic
+
+.err_invalid_var:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.err_name_too_long:
+    mov  bx, ERR_NAME_TOO_LONG
+    jmp  error
+
+.end_of_file:
+    cmp  r13d, CMT_BLOCK
+    jne  .ok
+    mov  bx, ERR_UNTERMINATED_CMT
+    jmp  error
+.ok:
+    call purge_tvars            ; temporaries die with the script
+    ; TODO: also call purge_tvars when a `def` body / block ends (scopes aren't parsed yet)
+    xor  eax, eax
+    add  rsp, 32
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rdi
+    pop  rsi
+    pop  rbx
+    ret
+
+; TODO compilation modes (were empty fall-through labels):
+;   standard_compile / shell_compile / core_compile
+
+; ---- helpers ----------------------------------------------------------------
+
+; Exit with 0x100 + BX. Aligns the stack itself so it is safe from any depth.
+error:
+    movzx ecx, bx
+    add  ecx, 0x100
+    and  rsp, -16
+    sub  rsp, 32
+    call ExitProcess
+
+; in: AL   out: EAX = 1 if AL is one of [A-Za-z0-9_.], else 0
+ident_char:
+    cmp  al, '_'
+    je   .yes
+    cmp  al, '.'
+    je   .yes
+    cmp  al, '0'
+    jb   .no
+    cmp  al, '9'
+    jbe  .yes
+    or   al, 0x20
+    cmp  al, 'a'
+    jb   .no
+    cmp  al, 'z'
+    jbe  .yes
+.no:
+    xor  eax, eax
+    ret
+.yes:
+    mov  eax, 1
+    ret
+
+; in: RDI = token, RCX = length   out: EAX = FN_* flag, 0 if not a keyword
+match_keyword:
+    lea  r8, [kw_table]
+.entry:
+    movzx r9d, byte [r8]
+    test r9d, r9d
+    jz   .prefixes
+    cmp  r9, rcx
+    jne  .skip
+    xor  r10d, r10d
+.cmp:
+    mov  al, [r8 + 1 + r10]
+    cmp  al, [rdi + r10]
+    jne  .skip
+    inc  r10
+    cmp  r10, rcx
+    jb   .cmp
+    movzx eax, word [r8 + 1 + r9]
+    ret
+.skip:
+    lea  r8, [r8 + r9 + 3]      ; length byte + name + 2-byte flag
+    jmp  .entry
+.prefixes:
+    cmp  rcx, 4
+    jbe  .try_fs
+    cmp  dword [rdi], 'mem.'
+    jne  .try_fs
+    mov  eax, FN_MEM
+    ret
+.try_fs:
+    cmp  rcx, 3
+    jbe  .none
+    cmp  word [rdi], 'fs'
+    jne  .none
+    cmp  byte [rdi + 2], '.'
+    jne  .none
+    mov  eax, FN_FS
+    ret
+.none:
+    xor  eax, eax
+    ret
+
+; in: RDI = token, RCX = length, R15 = var_table
+; out: RAX = address of the variable's record (its length byte), or 0
+; clobbers RDX, R8-R11. Compares the whole name (the old code compared only the
+; first character, did `movzx r8, ah`-style tricks that left dirty upper bits,
+; and never finished the "found" path).
+find_var:
+    movzx r8d, byte [r15]       ; number of variables
+    lea  rdx, [r15 + 1]
+.next:
+    test r8d, r8d
+    jz   .none
+    movzx r9d, byte [rdx]       ; name length
+    movzx r10d, byte [rdx + 1]  ; type
+    cmp  r9, rcx
+    jne  .skip
+    xor  r11d, r11d
+.cmp:
+    mov  al, [rdx + 2 + r11]
+    cmp  al, [rdi + r11]
+    jne  .skip
+    inc  r11
+    cmp  r11, rcx
+    jb   .cmp
+    mov  rax, rdx
+    ret
+.skip:
+    lea  rdx, [rdx + 2 + r9]    ; -> value
+    and  r10d, VAR_TYPE_MASK    ; ignore the temporary flag when sizing the record
+    cmp  r10d, 2
+    jne  .fixed
+    xor  eax, eax               ; long string: decode big-endian length, skip payload
+    mov  r11d, 8
+.len:
+    shl  rax, 8
+    movzx r10d, byte [rdx]
+    or   rax, r10
+    inc  rdx
+    dec  r11d
+    jnz  .len
+    add  rdx, rax
+    dec  r8d
+    jmp  .next
+.fixed:
+    add  rdx, 8
+    dec  r8d
+    jmp  .next
+.none:
+    xor  eax, eax
+    ret
+
+; Removes every temporary variable (type bit 7) from the table and compacts the
+; survivors downward, so sticky variables keep their order and values.
+; in: R15 = var_table   clobbers RAX, RCX, RDX, R8-R11 (NOT rsi/rdi, compile uses them)
+purge_tvars:
+    movzx r8d, byte [r15]       ; records left to scan
+    lea  rdx, [r15 + 1]         ; read cursor
+    mov  r9, rdx                ; write cursor
+.next:
+    test r8d, r8d
+    jz   .done
+    movzx ecx, byte [rdx]       ; name length
+    add  ecx, 2                 ; + len/type bytes
+    movzx r10d, byte [rdx + 1]  ; type byte (keeps the temp flag)
+    mov  r11d, r10d
+    and  r11d, VAR_TYPE_MASK
+    lea  rax, [rdx + rcx]       ; -> value
+    add  rcx, 8                 ; every value starts with 8 bytes
+    cmp  r11d, 2
+    jne  .sized
+    mov  r11, [rax]             ; lstring: big-endian payload length
+    bswap r11
+    add  rcx, r11
+.sized:                         ; rcx = whole record size
+    test r10b, VAR_TEMP
+    jnz  .drop
+    cmp  r9, rdx
+    je   .advance               ; nothing dropped yet, already in place
+    xor  eax, eax
+.copy:                          ; forward copy is safe: dest is always below source
+    mov  r11b, [rdx + rax]
+    mov  [r9 + rax], r11b
+    inc  rax
+    cmp  rax, rcx
+    jb   .copy
+.advance:
+    add  r9, rcx
+    add  rdx, rcx
+    dec  r8d
+    jmp  .next
+.drop:
+    add  rdx, rcx
+    dec  byte [r15]             ; one fewer variable
+    dec  r8d
+    jmp  .next
+.done:
+    ret
+
+; Hands the finished statement to the writer. Not called yet (TODO: call it when
+; a statement ends). Fixed vs. the old inline version: it is a real routine now
+; (ends in `ret`; the old block fell off the end into whatever came next), the
+; 15 pushes + 32 shadow bytes keep rsp aligned for the call, and the undefined
+; labels are gone.
+write_current_func:
     push rax
     push rbx
     push rcx
@@ -319,31 +488,35 @@ compile:
     push r13
     push r14
     push r15
-    cmp r14, 0x0005
-    je .write_var_def_findvals
-    jmp .decode_current_func
-.call_write_func:
+    sub  rsp, 32
+    cmp  r14d, FN_VAR
+    je   .var
+    cmp  r14d, FN_TVAR          ; same record format; the writer sets VAR_TEMP on the type byte
+    je   .var
     call write_func
-    jmp .retrieve_stored_registers
-.call_write_var:
+    jmp  .restore
+.var:
     call write_var
-    jmp .retrieve_stored_registers
-.decode_current_func:
-.write_var_def_findvals:
-    
-.retrieve_stored_registers:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
+.restore:
+    add  rsp, 32
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rbp
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+    pop  rbx
+    pop  rax
+    ret
+
+section .text
+; Was `section .data / nlang_writer db '...' / %include nlang_writer`, which is
+; invalid (%include needs a quoted path and must be at file level).
+%include "nlang_writer.nasm"
