@@ -38,6 +38,14 @@ CMT_BLOCK equ 2                 ; '###' -> until the next '###'
 ERR_INVALID_VAR_SYNTAX equ 5    ; 'var' not followed by a space
 ERR_UNTERMINATED_CMT   equ 6    ; '###' never closed
 ERR_NAME_TOO_LONG      equ 7    ; identifier longer than 255 (length is stored in 1 byte)
+ERR_BAD_VAR_TYPE       equ 8    ; var/tvar type is not num, str or lstr
+ERR_STR_TOO_LONG       equ 9    ; 'str' literal longer than 8 characters (use lstr)
+ERR_UNTERMINATED_STR   equ 10   ; string literal not closed on its line
+ERR_REDECLARED         equ 11   ; name already in the variable table
+ERR_TABLE_FULL         equ 12   ; 255 variables or 64 KiB table
+ERR_OUTPUT_FULL        equ 13   ; generated NASM text exceeds the 1 MiB output buffer
+ERR_WRITE_FAILED       equ 14   ; could not create / write the .nasm file
+ERR_RESERVED_NAME      equ 15   ; name starting with "__" defined outside a .ns file
 
 VAR_TABLE_SIZE equ 0x10000
 
@@ -53,6 +61,20 @@ section .bss
     ;   type 1 = string : 8-byte value (max 8 characters)
     ;   type 2 = lstring: 8-byte big-endian length, then that many payload bytes
     var_table resb VAR_TABLE_SIZE
+
+    ; The declaration currently being compiled (filled by parse_var_decl, read by
+    ; add_var and the writer's write_var).
+    is_ns       resb 1              ; 1 when the input file is a .ns (package) file
+    resb 7
+    vd_name     resq 1              ; -> name in the source buffer
+    vd_len      resq 1
+    vd_type     resb 1              ; 0 num, 1 str, 2 lstr
+    vd_temp     resb 1              ; 1 for tvar
+    vd_has_init resb 1
+    resb 5
+    vd_value    resq 1              ; num value, or the str packed little-endian
+    vd_lit_ptr  resq 1              ; lstr payload (in the source buffer)
+    vd_lit_len  resq 1
 
 section .data
 ; keyword table: [len][name][dw flag] ... terminated by a zero length byte
@@ -77,6 +99,8 @@ kw_table:
     db 0
 ; "mem." and "fs." families are matched by prefix in match_keyword.
 
+zero_char: db '0'               ; default value of an uninitialised str / lstr
+
 section .text
 
 ; From this point on is the compiler for the code.
@@ -89,6 +113,17 @@ section .text
 ; for @ = *: - Loop that continues until a value, here represented as an @, is equal to a number, represented as an *.
 ; var num/str/lstr @@@ [= *] - Defines a variable. Its name is represented here as '@@@', and the brackets show an optional way of defining the variable immediately. Otherwise, the variable is initialized to 0 or '0'. Num sets the variable type to a number. Str sets the variable type to a string, at most 8 characters. Lstr sets the variable type to a long string, using RAM space to store the value. Lstr variables are slower, but can contain much more data at once.
 ; tvar num/str/lstr @@@ [= *] - Defines a temporary variable. Its name is represented here as '@@@', and the brackets show an optional way of defining the variable immediately. Otherwise, the variable is initialized to 0 or '0'. Num sets the variable type to a number. Str sets the variable type to a string, at most 8 characters. Lstr sets the variable type to a long string, using RAM space to store the value. Lstr variables are slower, but can contain much more data at once. Temporary variables only exist in the compiled variable table for the duration of the active function, script, or function.
+; list functions - Functions that allow the user to manipulate lists, which are arrays of values. The functions are as follows:
+; list num/str @@@ - Creates a list of values, named here as '@@@'. The list can be of numbers or strings, but not long strings. The list is stored in RAM, and entries can be accessed with the list.@@@[#] function.
+; list.@@@[#] - Used to access a value in a list, where the list is named here as '@@@', and the index of the value is represented here as '#'.
+; list.@@@.append * - Appends a value, represented here as '*', to the end of a list, where the list is named here as '@@@'.
+; list.@@@.insert #, * - Inserts a value, represented here as '*', into a list, where the list is named here as '@@@', and the index of the value is represented here as '#'.
+; list.@@@.remove # - Removes a value from a list, where the list is named here as '@@@', and the index of the value is represented here as '#'.
+; list.@@@.clear - Clears all values from a list, where the list is named here as '@@@'.
+; list.@@@.length - Returns the number of values in a list, where the list is named here as '@@@'.
+; list.@@@.sort - Sorts the values in a list by value (in the case of numerical lists), where the list is named here as '@@@'.
+; @@@[#] - Used to find the value at digit # in the string @@@.
+; @@@.length - Returns the length of the string @@@.
 ; # - Used to mark a comment. Single hashes mean one line, every character of text after that point. Triple hashes mean a multi-line comment, which continues until the next triple hash.
 ; bool ### % ### - used to compute boolean functions seperately, used when defining a variable's value. The result is stored in the variable, and can be used later in the code.
 ; def @@@ (args): - Defines a function. The name is represented here as '@@@', and arguments, however many are needed, are represented as 'args'. The function is called by using the name of the function, and passing in the arguments. The function can return a value, which can be used in the code.
@@ -148,6 +183,8 @@ compile:
     xor  r13d, r13d
     xor  r14d, r14d
     xor  ebx, ebx
+    call detect_ns              ; package names are only legal in .ns files
+    call out_begin              ; NASM header
 
 .func_logic:
     cmp  rsi, r12
@@ -180,6 +217,10 @@ compile:
     jmp  .func_logic
 
 .newline:
+    test r14d, r14d
+    jz   .nl_done
+    call write_current_func     ; the statement ended: hand it to the writer
+.nl_done:
     xor  r14d, r14d             ; a statement ends at the end of its line
     jmp  .next_char
 
@@ -252,12 +293,18 @@ compile:
     jz   .as_variable
     mov  r14d, eax
     cmp  eax, FN_VAR
-    je   .need_space
+    je   .decl
     cmp  eax, FN_TVAR
     jne  .func_logic
-.need_space:
-    cmp  byte [rsi], ' '        ; 'var' / 'tvar' must be followed by a space
+.decl:
+    mov  al, [rsi]              ; 'var' / 'tvar' must be followed by a space or tab
+    cmp  al, ' '
+    je   .decl_ok
+    cmp  al, 0x09
     jne  .err_invalid_var
+.decl_ok:
+    call parse_var_decl         ; consumes the rest of the statement, writes it out
+    xor  r14d, r14d
     jmp  .func_logic
 
 .as_variable:
@@ -280,7 +327,12 @@ compile:
     mov  bx, ERR_UNTERMINATED_CMT
     jmp  error
 .ok:
+    test r14d, r14d
+    jz   .finish
+    call write_current_func     ; last statement had no trailing newline
+.finish:
     call purge_tvars            ; temporaries die with the script
+    call out_end                ; footer, then write <input>.nasm
     ; TODO: also call purge_tvars when a `def` body / block ends (scopes aren't parsed yet)
     xor  eax, eax
     add  rsp, 32
@@ -419,6 +471,328 @@ find_var:
 .none:
     xor  eax, eax
     ret
+
+; ---- var / tvar declarations ------------------------------------------------
+; These helpers use RSI (cursor) and R12 (end) from compile; they clobber
+; RAX, RCX, RDX, RDI, RBX, R8-R11 only.
+
+skip_blanks:                    ; skip spaces and tabs
+.l: cmp  rsi, r12
+    jae  .d
+    mov  al, [rsi]
+    cmp  al, ' '
+    je   .n
+    cmp  al, 0x09
+    jne  .d
+.n: inc  rsi
+    jmp  .l
+.d: ret
+
+read_ident:                     ; out: RDI = start, RCX = length (0 = none)
+    mov  rdi, rsi
+.l: cmp  rsi, r12
+    jae  .d
+    mov  al, [rsi]
+    call ident_char
+    test eax, eax
+    jz   .d
+    inc  rsi
+    jmp  .l
+.d: mov  rcx, rsi
+    sub  rcx, rdi
+    ret
+
+; ---- names reserved for .ns files ---------------------------------------------
+; A variable name that starts with "__" (two underscores) is reserved for packages:
+; it may only be defined in a .ns file; anywhere else defining one is error 0x10F.
+; (The check is in parse_var_decl; to change the prefix, change it there.)
+
+; Sets is_ns = 1 if the input path ends in ".ns" (the opener already validated it).
+detect_ns:
+    lea  rdx, [path_buf]
+    xor  r8d, r8d               ; last '.'
+.scan:
+    mov  al, [rdx]
+    test al, al
+    jz   .done
+    cmp  al, '.'
+    jne  .next
+    mov  r8, rdx
+.next:
+    inc  rdx
+    jmp  .scan
+.done:
+    mov  byte [is_ns], 0
+    test r8, r8
+    jz   .ret
+    cmp  dword [r8], 0x00736E2E ; ".ns", NUL
+    jne  .ret
+    mov  byte [is_ns], 1
+.ret:
+    ret
+
+; out: RAX = value. Accepts [-]decimal or [-]0xHEX.
+parse_number:
+    xor  r9d, r9d               ; negative?
+    cmp  rsi, r12
+    jae  .bad
+    cmp  byte [rsi], '-'
+    jne  .digits
+    mov  r9d, 1
+    inc  rsi
+.digits:
+    xor  eax, eax
+    xor  r10d, r10d             ; digit count
+    mov  r11d, 10               ; base
+    lea  rcx, [rsi + 2]
+    cmp  rcx, r12
+    ja   .loop
+    cmp  byte [rsi], '0'
+    jne  .loop
+    mov  dl, [rsi + 1]
+    or   dl, 0x20
+    cmp  dl, 'x'
+    jne  .loop
+    mov  r11d, 16
+    add  rsi, 2
+.loop:
+    cmp  rsi, r12
+    jae  .done
+    movzx edx, byte [rsi]
+    sub  edx, '0'
+    cmp  edx, 9
+    jbe  .have
+    cmp  r11d, 16
+    jne  .done
+    movzx edx, byte [rsi]
+    or   edx, 0x20
+    sub  edx, 'a'
+    cmp  edx, 5
+    ja   .done
+    add  edx, 10
+.have:
+    imul rax, r11
+    add  rax, rdx
+    inc  r10d
+    inc  rsi
+    jmp  .loop
+.done:
+    test r10d, r10d
+    jz   .bad
+    test r9d, r9d
+    jz   .ret
+    neg  rax
+.ret:
+    ret
+.bad:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
+; Reads 'text' or "text" (no escape sequences yet) -> vd_lit_ptr / vd_lit_len.
+parse_string_lit:
+    cmp  rsi, r12
+    jae  .bad
+    mov  al, [rsi]
+    cmp  al, "'"
+    je   .open
+    cmp  al, '"'
+    jne  .bad
+.open:
+    inc  rsi
+    mov  [vd_lit_ptr], rsi
+.scan:
+    cmp  rsi, r12
+    jae  .unterminated
+    cmp  byte [rsi], 0x0A
+    je   .unterminated
+    cmp  byte [rsi], al
+    je   .closed
+    inc  rsi
+    jmp  .scan
+.closed:
+    mov  rcx, rsi
+    sub  rcx, [vd_lit_ptr]
+    mov  [vd_lit_len], rcx
+    inc  rsi                    ; past the closing quote
+    ret
+.unterminated:
+    mov  bx, ERR_UNTERMINATED_STR
+    jmp  error
+.bad:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
+; var|tvar  num|str|lstr  name  [= literal]      (RSI is just past the keyword)
+; Parses the rest of the statement, enters the variable in the table and writes
+; its NASM. Leaves RSI at the end of the statement (newline / '#' / EOF).
+parse_var_decl:
+    call skip_blanks
+    call read_ident
+    test rcx, rcx
+    jz   .syntax
+    cmp  rcx, 3
+    jne  .try_lstr
+    cmp  word [rdi], 'nu'
+    jne  .try_str
+    cmp  byte [rdi + 2], 'm'
+    jne  .bad_type
+    mov  byte [vd_type], 0
+    jmp  .got_type
+.try_str:
+    cmp  word [rdi], 'st'
+    jne  .bad_type
+    cmp  byte [rdi + 2], 'r'
+    jne  .bad_type
+    mov  byte [vd_type], 1
+    jmp  .got_type
+.try_lstr:
+    cmp  rcx, 4
+    jne  .bad_type
+    cmp  dword [rdi], 'lstr'
+    jne  .bad_type
+    mov  byte [vd_type], 2
+.got_type:
+    call skip_blanks
+    call read_ident
+    test rcx, rcx
+    jz   .syntax
+    movzx eax, byte [rdi]
+    sub  eax, '0'
+    cmp  eax, 9
+    jbe  .syntax                ; a name can't start with a digit
+    cmp  rcx, 255
+    ja   .too_long
+    cmp  byte [is_ns], 0
+    jne  .name_ok               ; .ns files may define reserved names
+    cmp  rcx, 2
+    jb   .name_ok
+    cmp  word [rdi], '__'       ; reserved prefix
+    je   .reserved
+.name_ok:
+    mov  [vd_name], rdi
+    mov  [vd_len], rcx
+    call find_var
+    test rax, rax
+    jnz  .redeclared
+
+    cmp  r14d, FN_TVAR
+    sete al
+    mov  [vd_temp], al
+    mov  byte [vd_has_init], 0
+    mov  qword [vd_value], 0
+    cmp  byte [vd_type], 1
+    jne  .def_lit
+    mov  qword [vd_value], 0x30 ; str defaults to '0'
+.def_lit:
+    lea  rax, [zero_char]       ; lstr defaults to "0"
+    mov  [vd_lit_ptr], rax
+    mov  qword [vd_lit_len], 1
+
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .end_check
+    cmp  byte [rsi], '='
+    jne  .end_check
+    inc  rsi
+    call skip_blanks
+    mov  byte [vd_has_init], 1
+    cmp  byte [vd_type], 0
+    jne  .init_str
+    call parse_number
+    mov  [vd_value], rax
+    jmp  .end_check
+.init_str:
+    call parse_string_lit
+    cmp  byte [vd_type], 2
+    je   .end_check
+    mov  rcx, [vd_lit_len]      ; str: pack up to 8 chars into a qword, first char lowest
+    cmp  rcx, 8
+    ja   .str_long
+    mov  rdx, [vd_lit_ptr]
+    xor  eax, eax
+.pack:
+    test rcx, rcx
+    jz   .packed
+    dec  rcx
+    shl  rax, 8
+    movzx r8d, byte [rdx + rcx]
+    or   rax, r8
+    jmp  .pack
+.packed:
+    mov  [vd_value], rax
+.end_check:                     ; nothing but a comment may follow
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .store
+    mov  al, [rsi]
+    cmp  al, 0x0A
+    je   .store
+    cmp  al, 0x0D
+    je   .store
+    cmp  al, '#'
+    je   .store
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.store:
+    call add_var
+    jmp  write_var              ; tail call
+.bad_type:
+    mov  bx, ERR_BAD_VAR_TYPE
+    jmp  error
+.too_long:
+    mov  bx, ERR_NAME_TOO_LONG
+    jmp  error
+.redeclared:
+    mov  bx, ERR_REDECLARED
+    jmp  error
+.reserved:
+    mov  bx, ERR_RESERVED_NAME
+    jmp  error
+.str_long:
+    mov  bx, ERR_STR_TOO_LONG
+    jmp  error
+
+; Appends the vd_* declaration to var_table.
+; (An lstr is entered with an empty payload: the table only needs its name/type.)
+add_var:
+    xor  ecx, ecx               ; length 0 never matches, so find_var walks to the end
+    call find_var               ; ... and leaves RDX = end of the last record
+    movzx eax, byte [r15]
+    cmp  eax, 255
+    jae  .full
+    mov  r8, [vd_len]
+    lea  r9, [rdx + r8 + 10]
+    lea  rax, [r15 + VAR_TABLE_SIZE]
+    cmp  r9, rax
+    ja   .full
+    mov  [rdx], r8b
+    movzx eax, byte [vd_type]
+    cmp  byte [vd_temp], 0
+    je   .typed
+    or   al, VAR_TEMP
+.typed:
+    mov  [rdx + 1], al
+    mov  r9, [vd_name]
+    xor  r10d, r10d
+.nc:
+    mov  r11b, [r9 + r10]
+    mov  [rdx + 2 + r10], r11b
+    inc  r10
+    cmp  r10, r8
+    jb   .nc
+    lea  rdx, [rdx + 2 + r8]
+    xor  eax, eax
+    cmp  byte [vd_type], 2
+    je   .val
+    mov  rax, [vd_value]
+.val:
+    mov  [rdx], rax
+    inc  byte [r15]
+    ret
+.full:
+    mov  bx, ERR_TABLE_FULL
+    jmp  error
 
 ; Removes every temporary variable (type bit 7) from the table and compacts the
 ; survivors downward, so sticky variables keep their order and values.
