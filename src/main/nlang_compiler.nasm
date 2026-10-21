@@ -24,10 +24,28 @@ FN_IMPORT equ 11
 FN_MEM    equ 12
 FN_FS     equ 13
 FN_TVAR   equ 14                ; like FN_VAR, but the variable is temporary
+FN_LISTDECL equ 15              ; list num|str name
+FN_LISTOP   equ 16              ; list.name.append / insert / remove / clear / sort
 
 ; ---- variable type byte -----------------------------------------------------
 VAR_TEMP      equ 0x80          ; bit 7 set = temporary (tvar), removed by purge_tvars
-VAR_TYPE_MASK equ 0x7F          ; low bits: 0 = num, 1 = str, 2 = lstr
+VAR_TYPE_MASK equ 0x7F          ; low bits: 0 = num, 1 = str, 2 = lstr, 3 = list num, 4 = list str
+
+; ---- value expressions (var initialisers): expr_kind -------------------------
+EX_COPY     equ 1               ; other_var
+EX_STR_LEN  equ 2               ; s.length         (s is a str)
+EX_STR_IDX  equ 3               ; s[#]
+EX_LSTR_LEN equ 4               ; l.length         (l is an lstr)
+EX_LSTR_IDX equ 5               ; l[#]
+EX_LIST_LEN equ 6               ; list.x.length
+EX_LIST_IDX equ 7               ; list.x[#]
+
+; ---- list statements: ls_op ---------------------------------------------------
+LS_APPEND equ 1
+LS_INSERT equ 2
+LS_REMOVE equ 3
+LS_CLEAR  equ 4
+LS_SORT   equ 5
 
 ; ---- comment state kept in R13 ----------------------------------------------
 CMT_NONE  equ 0
@@ -35,10 +53,10 @@ CMT_LINE  equ 1                 ; '#'   -> until end of line
 CMT_BLOCK equ 2                 ; '###' -> until the next '###'
 
 ; ---- error codes (loaded into BX before `jmp error`) ------------------------
-ERR_INVALID_VAR_SYNTAX equ 5    ; 'var' not followed by a space
+ERR_INVALID_VAR_SYNTAX equ 5    ; malformed var / tvar / list statement
 ERR_UNTERMINATED_CMT   equ 6    ; '###' never closed
 ERR_NAME_TOO_LONG      equ 7    ; identifier longer than 255 (length is stored in 1 byte)
-ERR_BAD_VAR_TYPE       equ 8    ; var/tvar type is not num, str or lstr
+ERR_BAD_VAR_TYPE       equ 8    ; var/tvar type is not num, str or lstr (list: num or str)
 ERR_STR_TOO_LONG       equ 9    ; 'str' literal longer than 8 characters (use lstr)
 ERR_UNTERMINATED_STR   equ 10   ; string literal not closed on its line
 ERR_REDECLARED         equ 11   ; name already in the variable table
@@ -46,6 +64,10 @@ ERR_TABLE_FULL         equ 12   ; 255 variables or 64 KiB table
 ERR_OUTPUT_FULL        equ 13   ; generated NASM text exceeds the 1 MiB output buffer
 ERR_WRITE_FAILED       equ 14   ; could not create / write the .nasm file
 ERR_RESERVED_NAME      equ 15   ; name starting with "__" defined outside a .ns file
+ERR_TYPE_MISMATCH      equ 16   ; value / operand has the wrong type for where it is used
+ERR_UNKNOWN_VAR        equ 17   ; name is not declared
+ERR_NOT_A_LIST         equ 18   ; list.x.<op> where x is not a list
+ERR_NOT_A_STRING       equ 19   ; x.length / x[#] where x is not a str / lstr
 
 VAR_TABLE_SIZE equ 0x10000
 
@@ -60,6 +82,8 @@ section .bss
     ;   type 0 = number : 8-byte value
     ;   type 1 = string : 8-byte value (max 8 characters)
     ;   type 2 = lstring: 8-byte big-endian length, then that many payload bytes
+    ;   type 3 = list of numbers, type 4 = list of strings: 8 zero bytes
+    ;            (the entries live in the generated program, not in this table)
     var_table resb VAR_TABLE_SIZE
 
     ; The declaration currently being compiled (filled by parse_var_decl, read by
@@ -71,10 +95,27 @@ section .bss
     vd_type     resb 1              ; 0 num, 1 str, 2 lstr
     vd_temp     resb 1              ; 1 for tvar
     vd_has_init resb 1
-    resb 5
+    vd_init_kind resb 1             ; 0 = literal in vd_value, 1 = expression in expr_*
+    resb 4
     vd_value    resq 1              ; num value, or the str packed little-endian
     vd_lit_ptr  resq 1              ; lstr payload (in the source buffer)
     vd_lit_len  resq 1
+
+    ; Operands, value expressions and list statements.
+    opd_kind    resb 1              ; 0 immediate (opd_imm), 1 variable (opd_name)
+    opd_want    resb 1              ; type the operand must have: 0 num, 1 str
+    expr_kind   resb 1              ; EX_*
+    expr_type   resb 1              ; type of the expression's value: 0 num, 1 str
+    ls_op       resb 1              ; LS_*
+    ls_type     resb 1              ; 3 list num, 4 list str
+    resb 2
+    opd_imm     resq 1
+    opd_name    resq 1
+    opd_len     resq 1
+    expr_name   resq 1
+    expr_len    resq 1
+    ls_name     resq 1
+    ls_len      resq 1
 
 section .data
 ; keyword table: [len][name][dw flag] ... terminated by a zero length byte
@@ -90,6 +131,7 @@ kw_table:
     KW "else",   FN_ELSE
     KW "var",    FN_VAR
     KW "tvar",   FN_TVAR
+    KW "list",   FN_LISTDECL
     KW "while",  FN_WHILE
     KW "until",  FN_UNTIL
     KW "for",    FN_FOR
@@ -295,15 +337,30 @@ compile:
     cmp  eax, FN_VAR
     je   .decl
     cmp  eax, FN_TVAR
-    jne  .func_logic
+    je   .decl
+    cmp  eax, FN_LISTDECL
+    je   .decl
+    cmp  eax, FN_LISTOP
+    je   .list_op
+    jmp  .func_logic
 .decl:
-    mov  al, [rsi]              ; 'var' / 'tvar' must be followed by a space or tab
+    mov  al, [rsi]              ; 'var' / 'tvar' / 'list' must be followed by a space or tab
     cmp  al, ' '
     je   .decl_ok
     cmp  al, 0x09
     jne  .err_invalid_var
 .decl_ok:
+    cmp  r14d, FN_LISTDECL
+    je   .list_decl
     call parse_var_decl         ; consumes the rest of the statement, writes it out
+    jmp  .stmt_done
+.list_decl:
+    call parse_list_decl
+.stmt_done:
+    xor  r14d, r14d
+    jmp  .func_logic
+.list_op:
+    call parse_list_op          ; RDI / RCX still hold the token list.name.method
     xor  r14d, r14d
     jmp  .func_logic
 
@@ -403,6 +460,15 @@ match_keyword:
     lea  r8, [r8 + r9 + 3]      ; length byte + name + 2-byte flag
     jmp  .entry
 .prefixes:
+    cmp  rcx, 5                 ; "list." + at least one more character
+    jbe  .try_mem
+    cmp  dword [rdi], 'list'
+    jne  .try_mem
+    cmp  byte [rdi + 4], '.'
+    jne  .try_mem
+    mov  eax, FN_LISTOP
+    ret
+.try_mem:
     cmp  rcx, 4
     jbe  .try_fs
     cmp  dword [rdi], 'mem.'
@@ -652,6 +718,85 @@ parse_var_decl:
     jne  .bad_type
     mov  byte [vd_type], 2
 .got_type:
+    call read_new_name          ; validates the name, sets vd_name / vd_len
+
+    cmp  r14d, FN_TVAR
+    sete al
+    mov  [vd_temp], al
+    mov  byte [vd_has_init], 0
+    mov  byte [vd_init_kind], 0
+    mov  qword [vd_value], 0
+    cmp  byte [vd_type], 1
+    jne  .def_lit
+    mov  qword [vd_value], 0x30 ; str defaults to '0'
+.def_lit:
+    lea  rax, [zero_char]       ; lstr defaults to "0"
+    mov  [vd_lit_ptr], rax
+    mov  qword [vd_lit_len], 1
+
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .end_check
+    cmp  byte [rsi], '='
+    jne  .end_check
+    inc  rsi
+    call skip_blanks
+    mov  byte [vd_has_init], 1
+    cmp  byte [vd_type], 2
+    je   .literal               ; lstr takes a string literal only
+    cmp  rsi, r12
+    jae  .literal               ; (the literal parsers report the missing value)
+    mov  al, [rsi]
+    call is_ident_start
+    test eax, eax
+    jnz  .expr
+.literal:
+    cmp  byte [vd_type], 0
+    jne  .init_str
+    call parse_number
+    mov  [vd_value], rax
+    jmp  .end_check
+.expr:
+    call parse_value_expr       ; var, s.length, s[#], list.x.length, list.x[#]
+    cmp  al, [vd_type]
+    jne  .mismatch
+    mov  byte [vd_init_kind], 1
+    jmp  .end_check
+.init_str:
+    call parse_string_lit
+    cmp  byte [vd_type], 2
+    je   .end_check
+    call pack_str_lit           ; str: up to 8 chars in a qword, first char lowest
+    mov  [vd_value], rax
+.end_check:                     ; nothing but a comment may follow
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .store
+    mov  al, [rsi]
+    cmp  al, 0x0A
+    je   .store
+    cmp  al, 0x0D
+    je   .store
+    cmp  al, '#'
+    je   .store
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.store:
+    call add_var
+    jmp  write_var              ; tail call
+.bad_type:
+    mov  bx, ERR_BAD_VAR_TYPE
+    jmp  error
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+
+; ---- shared pieces -------------------------------------------------------------
+
+; Reads the name of a variable / list that is being DEFINED: validates it, applies
+; the reserved "__" rule and the redeclaration check, and fills vd_name / vd_len.
+read_new_name:
     call skip_blanks
     call read_ident
     test rcx, rcx
@@ -674,83 +819,414 @@ parse_var_decl:
     call find_var
     test rax, rax
     jnz  .redeclared
+    ret
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.too_long:
+    mov  bx, ERR_NAME_TOO_LONG
+    jmp  error
+.reserved:
+    mov  bx, ERR_RESERVED_NAME
+    jmp  error
+.redeclared:
+    mov  bx, ERR_REDECLARED
+    jmp  error
 
-    cmp  r14d, FN_TVAR
-    sete al
-    mov  [vd_temp], al
-    mov  byte [vd_has_init], 0
-    mov  qword [vd_value], 0
-    cmp  byte [vd_type], 1
-    jne  .def_lit
-    mov  qword [vd_value], 0x30 ; str defaults to '0'
-.def_lit:
-    lea  rax, [zero_char]       ; lstr defaults to "0"
-    mov  [vd_lit_ptr], rax
-    mov  qword [vd_lit_len], 1
-
+; Only a comment (or nothing) may follow on the line.
+expect_end:
     call skip_blanks
     cmp  rsi, r12
-    jae  .end_check
-    cmp  byte [rsi], '='
-    jne  .end_check
-    inc  rsi
-    call skip_blanks
-    mov  byte [vd_has_init], 1
-    cmp  byte [vd_type], 0
-    jne  .init_str
-    call parse_number
-    mov  [vd_value], rax
-    jmp  .end_check
-.init_str:
-    call parse_string_lit
-    cmp  byte [vd_type], 2
-    je   .end_check
-    mov  rcx, [vd_lit_len]      ; str: pack up to 8 chars into a qword, first char lowest
+    jae  .ok
+    mov  al, [rsi]
+    cmp  al, 0x0A
+    je   .ok
+    cmp  al, 0x0D
+    je   .ok
+    cmp  al, '#'
+    je   .ok
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.ok:
+    ret
+
+is_ident_start:                 ; in: AL   out: EAX = 1 for a letter or '_'
+    cmp  al, '_'
+    je   .yes
+    or   al, 0x20
+    cmp  al, 'a'
+    jb   .no
+    cmp  al, 'z'
+    jbe  .yes
+.no:
+    xor  eax, eax
+    ret
+.yes:
+    mov  eax, 1
+    ret
+
+; in: RDI = token, RCX = length   out: EAX = 1 and RCX -= 7 if it ends in ".length"
+strip_length:
+    cmp  rcx, 8                 ; at least one name character + ".length"
+    jb   .no
+    lea  rdx, [rdi + rcx - 7]
+    cmp  dword [rdx], '.len'
+    jne  .no
+    cmp  word [rdx + 4], 'gt'
+    jne  .no
+    cmp  byte [rdx + 6], 'h'
+    jne  .no
+    sub  rcx, 7
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
+; vd_lit_ptr / vd_lit_len -> RAX: up to 8 characters packed little-endian
+pack_str_lit:
+    mov  rcx, [vd_lit_len]
     cmp  rcx, 8
-    ja   .str_long
+    ja   .long
     mov  rdx, [vd_lit_ptr]
     xor  eax, eax
 .pack:
     test rcx, rcx
-    jz   .packed
+    jz   .done
     dec  rcx
     shl  rax, 8
     movzx r8d, byte [rdx + rcx]
     or   rax, r8
     jmp  .pack
-.packed:
-    mov  [vd_value], rax
-.end_check:                     ; nothing but a comment may follow
+.done:
+    ret
+.long:
+    mov  bx, ERR_STR_TOO_LONG
+    jmp  error
+
+; ---- operands, values and lists -------------------------------------------------
+
+; One operand -> opd_*: a number, a 'string', or the name of a variable.
+; in: [opd_want] = the type it must have (0 num, 1 str)
+parse_operand:
     call skip_blanks
     cmp  rsi, r12
-    jae  .store
+    jae  .syntax
     mov  al, [rsi]
-    cmp  al, 0x0A
-    je   .store
-    cmp  al, 0x0D
-    je   .store
-    cmp  al, '#'
-    je   .store
+    cmp  al, "'"
+    je   .str
+    cmp  al, '"'
+    je   .str
+    cmp  al, '-'
+    je   .num
+    mov  cl, al
+    sub  cl, '0'
+    cmp  cl, 9
+    jbe  .num
+    call is_ident_start
+    test eax, eax
+    jz   .syntax
+    call read_ident
+    call find_var
+    test rax, rax
+    jz   .unknown
+    movzx eax, byte [rax + 1]
+    and  eax, VAR_TYPE_MASK
+    cmp  al, [opd_want]
+    jne  .mismatch              ; also rejects lstr and lists
+    mov  [opd_name], rdi
+    mov  [opd_len], rcx
+    mov  byte [opd_kind], 1
+    ret
+.num:
+    cmp  byte [opd_want], 0
+    jne  .mismatch
+    call parse_number
+    mov  [opd_imm], rax
+    mov  byte [opd_kind], 0
+    ret
+.str:
+    cmp  byte [opd_want], 1
+    jne  .mismatch
+    call parse_string_lit
+    call pack_str_lit
+    mov  [opd_imm], rax
+    mov  byte [opd_kind], 0
+    ret
 .syntax:
     mov  bx, ERR_INVALID_VAR_SYNTAX
     jmp  error
-.store:
+.unknown:
+    mov  bx, ERR_UNKNOWN_VAR
+    jmp  error
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+
+; '[' number-or-variable ']'   -> opd_*
+parse_index:
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], '['
+    jne  .syntax
+    inc  rsi
+    mov  byte [opd_want], 0
+    call parse_operand
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ']'
+    jne  .syntax
+    inc  rsi
+    ret
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
+; A value on the right of 'var x =':
+;   other_var | s.length | s[#] | list.x.length | list.x[#]
+; out: AL = type of the value (0 num, 1 str); expr_* (and opd_* for an index) filled
+parse_value_expr:
+    call read_ident             ; RDI = token, RCX = length
+    cmp  rcx, 6
+    jb   .plain
+    cmp  dword [rdi], 'list'
+    jne  .plain
+    cmp  byte [rdi + 4], '.'
+    jne  .plain
+    add  rdi, 5                 ; --- list.NAME.length / list.NAME[#]
+    sub  rcx, 5
+    call strip_length
+    mov  [expr_kind], al        ; 1 = had ".length" (replaced by the EX_ code below)
+    mov  [expr_name], rdi
+    mov  [expr_len], rcx
+    call find_var
+    test rax, rax
+    jz   .unknown
+    movzx eax, byte [rax + 1]
+    and  eax, VAR_TYPE_MASK
+    cmp  eax, 3
+    jb   .not_list
+    cmp  eax, 4
+    ja   .not_list
+    cmp  byte [expr_kind], 1
+    je   .list_len
+    sub  eax, 3                 ; element type: list num -> num, list str -> str
+    mov  [expr_type], al
+    mov  byte [expr_kind], EX_LIST_IDX
+    call parse_index
+    mov  al, [expr_type]
+    ret
+.list_len:
+    mov  byte [expr_kind], EX_LIST_LEN
+    xor  eax, eax
+    ret
+
+.plain:                         ; --- NAME.length / NAME[#] / NAME
+    call strip_length
+    mov  [expr_kind], al
+    mov  [expr_name], rdi
+    mov  [expr_len], rcx
+    call find_var
+    test rax, rax
+    jz   .unknown
+    movzx eax, byte [rax + 1]
+    and  eax, VAR_TYPE_MASK
+    cmp  byte [expr_kind], 1
+    je   .str_len
+    cmp  rsi, r12
+    jae  .copy
+    cmp  byte [rsi], '['
+    je   .str_idx
+.copy:
+    cmp  eax, 1
+    ja   .mismatch              ; only num and str can be copied
+    mov  [expr_type], al
+    mov  byte [expr_kind], EX_COPY
+    ret
+.str_len:
+    cmp  eax, 1
+    je   .is_str_len
+    cmp  eax, 2
+    jne  .not_string
+    mov  byte [expr_kind], EX_LSTR_LEN
+    jmp  .len_done
+.is_str_len:
+    mov  byte [expr_kind], EX_STR_LEN
+.len_done:
+    xor  eax, eax
+    ret
+.str_idx:
+    cmp  eax, 1
+    je   .is_str_idx
+    cmp  eax, 2
+    jne  .not_string
+    mov  byte [expr_kind], EX_LSTR_IDX
+    jmp  .idx_done
+.is_str_idx:
+    mov  byte [expr_kind], EX_STR_IDX
+.idx_done:
+    call parse_index
+    mov  eax, 1                 ; a character is a str
+    ret
+.unknown:
+    mov  bx, ERR_UNKNOWN_VAR
+    jmp  error
+.not_list:
+    mov  bx, ERR_NOT_A_LIST
+    jmp  error
+.not_string:
+    mov  bx, ERR_NOT_A_STRING
+    jmp  error
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+
+; list  num|str  name                                   (RSI is just past 'list')
+parse_list_decl:
+    call skip_blanks
+    call read_ident
+    cmp  rcx, 3
+    jne  .bad_type
+    cmp  word [rdi], 'nu'
+    jne  .try_str
+    cmp  byte [rdi + 2], 'm'
+    jne  .bad_type
+    mov  byte [vd_type], 3
+    jmp  .got_type
+.try_str:
+    cmp  word [rdi], 'st'
+    jne  .bad_type
+    cmp  byte [rdi + 2], 'r'
+    jne  .bad_type
+    mov  byte [vd_type], 4
+.got_type:
+    call read_new_name
+    mov  byte [vd_temp], 0
+    mov  byte [vd_has_init], 0
+    mov  byte [vd_init_kind], 0
+    mov  qword [vd_value], 0
+    call expect_end
     call add_var
-    jmp  write_var              ; tail call
-.bad_type:
+    jmp  write_list_decl        ; tail call
+.bad_type:                      ; includes 'lstr': lists hold numbers or short strings
     mov  bx, ERR_BAD_VAR_TYPE
     jmp  error
-.too_long:
-    mov  bx, ERR_NAME_TOO_LONG
+
+; list.NAME.append v | .insert #, v | .remove # | .clear | .sort
+; in: RDI = the token "list.NAME.METHOD", RCX = its length; RSI just past it
+; (.length and list.NAME[#] produce values, so they are only legal in an initialiser)
+parse_list_op:
+    lea  r8, [rdi + rcx]
+.back:                          ; the method is whatever follows the last '.'
+    dec  r8
+    cmp  byte [r8], '.'
+    jne  .back
+    lea  r9, [rdi + 5]          ; start of NAME
+    cmp  r8, r9
+    jbe  .syntax                ; no name, or no method ("list.x")
+    mov  [ls_name], r9
+    mov  rax, r8
+    sub  rax, r9
+    mov  [ls_len], rax
+    lea  r10, [rdi + rcx]
+    inc  r8                     ; R8 = method, R10 = its length
+    sub  r10, r8
+    cmp  r10, 6
+    jne  .len5
+    cmp  dword [r8], 'appe'
+    jne  .m_insert
+    cmp  word [r8 + 4], 'nd'
+    jne  .syntax
+    mov  byte [ls_op], LS_APPEND
+    jmp  .lookup
+.m_insert:
+    cmp  dword [r8], 'inse'
+    jne  .m_remove
+    cmp  word [r8 + 4], 'rt'
+    jne  .syntax
+    mov  byte [ls_op], LS_INSERT
+    jmp  .lookup
+.m_remove:
+    cmp  dword [r8], 'remo'
+    jne  .syntax
+    cmp  word [r8 + 4], 've'
+    jne  .syntax
+    mov  byte [ls_op], LS_REMOVE
+    jmp  .lookup
+.len5:
+    cmp  r10, 5
+    jne  .len4
+    cmp  dword [r8], 'clea'
+    jne  .syntax
+    cmp  byte [r8 + 4], 'r'
+    jne  .syntax
+    mov  byte [ls_op], LS_CLEAR
+    jmp  .lookup
+.len4:
+    cmp  r10, 4
+    jne  .syntax
+    cmp  dword [r8], 'sort'
+    jne  .syntax
+    mov  byte [ls_op], LS_SORT
+.lookup:
+    mov  rdi, [ls_name]
+    mov  rcx, [ls_len]
+    call find_var
+    test rax, rax
+    jz   .unknown
+    movzx eax, byte [rax + 1]
+    and  eax, VAR_TYPE_MASK
+    cmp  eax, 3
+    jb   .not_list
+    cmp  eax, 4
+    ja   .not_list
+    mov  [ls_type], al
+    sub  al, 3                  ; element type for the operands
+    mov  cl, [ls_op]
+    cmp  cl, LS_APPEND
+    je   .append
+    cmp  cl, LS_INSERT
+    je   .insert
+    cmp  cl, LS_REMOVE
+    je   .remove
+    jmp  .done                  ; clear / sort take no operands
+.append:
+    mov  [opd_want], al
+    call parse_operand
+    call write_load_val
+    jmp  .done
+.insert:
+    mov  [expr_type], al        ; (scratch) element type, kept across the index operand
+    mov  byte [opd_want], 0
+    call parse_operand
+    call write_load_idx
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ','
+    jne  .syntax
+    inc  rsi
+    mov  al, [expr_type]
+    mov  [opd_want], al
+    call parse_operand
+    call write_load_val
+    jmp  .done
+.remove:
+    mov  byte [opd_want], 0
+    call parse_operand
+    call write_load_idx
+.done:
+    call expect_end
+    jmp  write_list_op          ; tail call
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
     jmp  error
-.redeclared:
-    mov  bx, ERR_REDECLARED
+.unknown:
+    mov  bx, ERR_UNKNOWN_VAR
     jmp  error
-.reserved:
-    mov  bx, ERR_RESERVED_NAME
-    jmp  error
-.str_long:
-    mov  bx, ERR_STR_TOO_LONG
+.not_list:
+    mov  bx, ERR_NOT_A_LIST
     jmp  error
 
 ; Appends the vd_* declaration to var_table.
