@@ -8,6 +8,8 @@ bits 64
 default rel
 
 extern ExitProcess
+extern GetStdHandle
+extern WriteFile
 
 ; ---- statement flags kept in R14 (0 = start of a statement) -----------------
 FN_NONE   equ 0
@@ -26,6 +28,18 @@ FN_FS     equ 13
 FN_TVAR   equ 14                ; like FN_VAR, but the variable is temporary
 FN_LISTDECL equ 15              ; list num|str name
 FN_LISTOP   equ 16              ; list.name.append / insert / remove / clear / sort
+FN_ASSIGN   equ 17              ; x = expr / x += expr / x -= expr
+LSTR_MAX    equ 4096            ; bytes of text an lstr can hold (LSTR_CAP in the generated code)
+
+; ---- open blocks (if / elif / else / while / until / for, and def which is not compiled yet) ----
+BLK_MAX    equ 32               ; nesting depth
+BLK_SIZE   equ 40               ; bytes per entry of blk_stack (layout: see "blocks" below)
+BODY_UNSET equ 0xFFFFFFFF       ; the first line of a block's body has not been seen yet
+BK_IF      equ 1                ; in an if / elif branch (an elif / else may follow)
+BK_ELSE    equ 2                ; in an else branch
+BK_OPAQUE  equ 3                ; def body (compiled later)
+BK_LOOP    equ 4                ; while / until body
+BK_FOR     equ 5                ; for body
 
 ; ---- variable type byte -----------------------------------------------------
 VAR_TEMP      equ 0x80          ; bit 7 set = temporary (tvar), removed by purge_tvars
@@ -53,7 +67,7 @@ CMT_LINE  equ 1                 ; '#'   -> until end of line
 CMT_BLOCK equ 2                 ; '###' -> until the next '###'
 
 ; ---- error codes (loaded into BX before `jmp error`) ------------------------
-ERR_INVALID_VAR_SYNTAX equ 5    ; malformed var / tvar / list statement
+ERR_INVALID_VAR_SYNTAX equ 5    ; malformed var / tvar / list / if / elif / else statement
 ERR_UNTERMINATED_CMT   equ 6    ; '###' never closed
 ERR_NAME_TOO_LONG      equ 7    ; identifier longer than 255 (length is stored in 1 byte)
 ERR_BAD_VAR_TYPE       equ 8    ; var/tvar type is not num, str or lstr (list: num or str)
@@ -68,6 +82,14 @@ ERR_TYPE_MISMATCH      equ 16   ; value / operand has the wrong type for where i
 ERR_UNKNOWN_VAR        equ 17   ; name is not declared
 ERR_NOT_A_LIST         equ 18   ; list.x.<op> where x is not a list
 ERR_NOT_A_STRING       equ 19   ; x.length / x[#] where x is not a str / lstr
+ERR_UTF16              equ 20   ; input file is UTF-16 (BOM FF FE / FE FF)
+ERR_EXPECT_COLON       equ 21   ; if / elif / else line does not end with ':'
+ERR_ELSE_NO_IF         equ 22   ; elif / else with no open if at the same indentation
+ERR_BAD_INDENT         equ 23   ; indentation matches no open block
+ERR_BAD_COMPARE        equ 24   ; strings can only be compared with == and !=
+ERR_TOO_DEEP           equ 25   ; more than BLK_MAX blocks nested
+ERR_LSTR_TOO_BIG       equ 26   ; text longer than LSTR_MAX
+ERR_COUNT              equ 22   ; number of messages in err_msgs (codes 5..26)
 
 VAR_TABLE_SIZE equ 0x10000
 
@@ -117,6 +139,56 @@ section .bss
     ls_name     resq 1
     ls_len      resq 1
 
+    ; Messages to the console.
+    err_code    resd 1              ; 0x100 + ERR_*
+    mb_len      resd 1              ; bytes used in msg_buf
+    pt_ptr      resq 1
+    pt_len      resq 1
+    pt_written  resq 1
+    pd_buf      resb 32
+    hx_buf      resb 8
+    msg_buf     resb 1024
+    stmt_count  resd 1              ; statements seen (a statement starts with a keyword)
+    skip_count  resd 1              ; ... of which not compiled yet
+    ns_flag     resb 1
+    resb 3
+
+    ; Blocks (if / elif / else) and indentation.
+    blk_depth   resd 1              ; open blocks
+    chain_ctr   resd 1              ; if-chains started so far: their number is used in the labels
+    cur_indent  resd 1              ; indentation of the line being compiled
+    bl_w        resd 1              ; indentation of the statement being started
+    bl_kw       resd 1              ; its FN_* keyword (0 = not a keyword)
+    bl_cont     resd 1              ; 1 = this elif / else continues the open if-chain
+    cb_chain    resd 1              ; chain / branch numbers that the writer prints in labels
+    cb_k        resd 1
+    bl_first    resb 1              ; 1 = the statement is the first thing on its line
+    cond_op     resb 1              ; comparison: 1 ==, 2 !=, 3 <, 4 >, 5 <=, 6 >=
+    cmp_ltype   resb 1              ; type of the left operand: 0 num, 1 str
+    cmp_tmp     resb 1
+    cond_neg    resb 1              ; 1 = jump when the condition is TRUE (until)
+    resb 7
+    fo_name     resq 1              ; loop variable of a for
+    fo_len      resq 1
+    as_name     resq 1              ; assignment target: name in the source, length
+    as_len      resq 1
+    st_name     resq 1              ; where the writer stores a value: name, length, type of the variable
+    st_len      resq 1
+    ex_start    resq 1              ; start of the expression being parsed (to parse it again)
+    lit_ctr     resd 1              ; long string literals emitted so far (lit_<n>)
+    as_kind     resb 1              ; 0 '=', 1 '+=', 2 '-='
+    st_type     resb 1
+    ex_type     resb 1              ; type of the expression: 0 num, 1 str, 2 lstr
+    ex_cur      resb 1              ; type of the value so far
+    ex_sb       resb 1              ; 1 = the value so far is in the text builder
+    ex_plus     resb 1              ; the operator being parsed is '+' (otherwise ',')
+    ex_space    resb 1              ; ', ' joins with a space
+    ex_pure     resb 1              ; a ',' started from a number: the right side has to be text
+    cmp_imm     resq 1              ; literal operand
+    tk_ptr      resq 1              ; the token being looked at (saved across calls that clobber RDI / RCX)
+    tk_len      resq 1
+    blk_stack   resb BLK_MAX * BLK_SIZE
+
 section .data
 ; keyword table: [len][name][dw flag] ... terminated by a zero length byte
 %macro KW 2
@@ -142,6 +214,62 @@ kw_table:
 ; "mem." and "fs." families are matched by prefix in match_keyword.
 
 zero_char: db '0'               ; default value of an uninitialised str / lstr
+
+; STR name, text  ->  name: db text   /   name_len equ <length>      (also used by the writer)
+%macro STR 2
+%1:      db %2
+%1_len   equ $ - %1
+%endmacro
+
+; one length-prefixed message per error code, in code order (5, 6, 7, ...)
+%macro MSG 1
+    db %%end - %%start
+%%start: db %1
+%%end:
+%endmacro
+err_msgs:
+    MSG "malformed var / tvar / list / if / elif / else / while / until / for statement" ; 5
+    MSG "block comment '###' is never closed"                   ; 6
+    MSG "name is longer than 255 characters"                    ; 7
+    MSG "unknown type (use num, str or lstr; lists: num or str)" ; 8
+    MSG "a str holds at most 8 characters (use lstr)"           ; 9
+    MSG "string is not closed on its line"                      ; 10
+    MSG "name is already declared"                              ; 11
+    MSG "too many variables"                                    ; 12
+    MSG "generated output is too large"                         ; 13
+    MSG "could not write the output file"                       ; 14
+    MSG "names starting with __ are reserved for .ns files"     ; 15
+    MSG "value has the wrong type here"                         ; 16
+    MSG "unknown name"                                          ; 17
+    MSG "that name is not a list"                               ; 18
+    MSG "that name is not a str / lstr"                         ; 19
+    MSG "file is UTF-16: save it as UTF-8 or ANSI"              ; 20
+    MSG "expected ':' at the end of the line (conditions can't be joined: use bool)" ; 21
+    MSG "elif / else without a matching if"                     ; 22
+    MSG "indentation does not match any open block"             ; 23
+    MSG "strings can only be compared with == and !="           ; 24
+    MSG "blocks are nested too deeply (32 levels at most)"      ; 25
+    MSG "text is longer than 4096 bytes (the lstr limit)"       ; 26
+
+STR s_msg_err,  "nlang: error 0x"
+STR s_msg_line, " (line "
+STR s_msg_end,  "): "
+STR s_msg_nl,   `\n`
+STR s_msg_wrote, "nlang: wrote "
+STR s_msg_comp,  "nlang: compiling "
+STR s_msg_open,  " ("
+STR s_msg_bytes, " bytes"
+STR s_msg_pkg,   ", package file"
+STR s_msg_close, `)\n`
+STR s_msg_done,  "nlang: done - "
+STR s_msg_stmts, " statements"
+STR s_msg_skipd, " not compiled yet)"
+STR s_msg_names, " names declared"
+STR s_msg_comma, ", "
+STR s_msg_ind,   "  ["
+STR s_msg_rb,    "] "
+STR s_msg_todo,  "   (not compiled yet)"
+hex_digits: db "0123456789abcdef"
 
 section .text
 
@@ -225,7 +353,31 @@ compile:
     xor  r13d, r13d
     xor  r14d, r14d
     xor  ebx, ebx
+    mov  dword [blk_depth], 0
+    mov  dword [chain_ctr], 0
+    mov  dword [cur_indent], 0
     call detect_ns              ; package names are only legal in .ns files
+    cmp  qword [bytes_read], 2  ; a UTF-16 file (BOM FF FE or FE FF) would be read as garbage
+    jb   .not_utf16
+    movzx eax, word [rsi]
+    cmp  ax, 0xFEFF
+    je   .utf16
+    cmp  ax, 0xFFFE
+    jne  .not_utf16
+.utf16:
+    mov  bx, ERR_UTF16
+    jmp  error
+.not_utf16:
+    mov  rcx, rsi               ; UTF-16 without a BOM: source text never contains a NUL byte
+.nul_scan:
+    cmp  rcx, r12
+    jae  .text_ok
+    cmp  byte [rcx], 0
+    je   .utf16
+    inc  rcx
+    jmp  .nul_scan
+.text_ok:
+    call print_start            ; "nlang: compiling <file> (N bytes)"
     call out_begin              ; NASM header
 
 .func_logic:
@@ -330,10 +482,44 @@ compile:
 
     test r14d, r14d
     jnz  .as_variable           ; mid-statement: keywords are only variables here
+
+    ; A statement may start here: find out how far it is indented and which block it belongs to.
+    mov  [tk_ptr], rdi
+    mov  [tk_len], rcx
     call match_keyword
+    mov  [bl_kw], eax
+    call line_indent            ; EAX = indentation, or -1 when something else precedes it on the line
+    cmp  eax, -1
+    je   .not_first
+    mov  [bl_w], eax
+    mov  [cur_indent], eax
+    mov  byte [bl_first], 1
+    call blocks_line_start      ; ends finished blocks (emitting their labels); EAX = 1: continues an if-chain
+    mov  [bl_cont], eax
+    jmp  .indent_done
+.not_first:
+    mov  eax, [cur_indent]
+    mov  [bl_w], eax
+    mov  byte [bl_first], 0
+    mov  dword [bl_cont], 0
+    mov  eax, [bl_kw]           ; if / elif / else only start a statement at the beginning of a line
+    cmp  eax, FN_IF
+    je   .not_a_stmt
+    cmp  eax, FN_ELIF
+    je   .not_a_stmt
+    cmp  eax, FN_ELSE
+    jne  .indent_done
+.not_a_stmt:
+    mov  dword [bl_kw], 0
+.indent_done:
+    mov  rdi, [tk_ptr]
+    mov  rcx, [tk_len]
+    mov  eax, [bl_kw]
     test eax, eax
     jz   .as_variable
     mov  r14d, eax
+    call note_stmt              ; count it (and show it with -v)
+    mov  eax, r14d
     cmp  eax, FN_VAR
     je   .decl
     cmp  eax, FN_TVAR
@@ -342,6 +528,28 @@ compile:
     je   .decl
     cmp  eax, FN_LISTOP
     je   .list_op
+    cmp  eax, FN_IF
+    je   .if_stmt
+    cmp  eax, FN_ELIF
+    je   .elif_stmt
+    cmp  eax, FN_ELSE
+    je   .else_stmt
+    cmp  byte [bl_first], 0     ; loops / def only start a statement at the beginning of a line
+    je   .func_logic
+    cmp  eax, FN_WHILE
+    je   .while_stmt
+    cmp  eax, FN_UNTIL
+    je   .until_stmt
+    cmp  eax, FN_FOR
+    je   .for_stmt
+    cmp  eax, FN_DEF            ; def is not compiled yet, but it opens a block: the lines under
+    je   .opaque
+    jmp  .func_logic
+.opaque:
+    mov  dword [cb_chain], 0
+    mov  dword [cb_k], 0
+    mov  al, BK_OPAQUE
+    call push_frame
     jmp  .func_logic
 .decl:
     mov  al, [rsi]              ; 'var' / 'tvar' / 'list' must be followed by a space or tab
@@ -364,12 +572,182 @@ compile:
     xor  r14d, r14d
     jmp  .func_logic
 
-.as_variable:
-    call find_var               ; rax = record or 0
+; ---- if / elif / else ---------------------------------------------------------
+; Generated code for   if A == B: ... elif C > D: ... else: ...   (n = chain number):
+;       <A into rax> mov rbx, rax / <B into rax> / cmp rbx, rax / jne if_n_1
+;       ...if body...        jmp if_n_end
+;   if_n_1:  <C> ... / <D> ... / cmp rbx, rax / jle if_n_2
+;       ...elif body...      jmp if_n_end
+;   if_n_2:  ...else body...
+;   if_n_end:
+.if_stmt:
+    inc  dword [chain_ctr]
+    mov  eax, [chain_ctr]
+    mov  [cb_chain], eax
+    mov  dword [cb_k], 1
+    call write_comment_if
+    call parse_condition
+    call expect_colon_end
+    mov  al, BK_IF
+    call push_frame
+    jmp  .stmt_done
+.elif_stmt:
+    cmp  dword [bl_cont], 1
+    jne  .err_else_no_if
+    call top_frame
+    mov  eax, [r8 + 8]
+    mov  [cb_chain], eax
+    mov  eax, [r8 + 12]
+    mov  [cb_k], eax
+    call write_jmp_end          ; the branch that just ended jumps over the rest of the chain
+    call write_label_next       ; ... and a failed condition lands here
+    inc  dword [cb_k]
+    call write_comment_elif
+    call parse_condition
+    call expect_colon_end
+    call top_frame
+    mov  eax, [cb_k]
+    mov  [r8 + 12], eax
+    mov  dword [r8 + 4], BODY_UNSET
+    jmp  .stmt_done
+.else_stmt:
+    cmp  dword [bl_cont], 1
+    jne  .err_else_no_if
+    call top_frame
+    mov  eax, [r8 + 8]
+    mov  [cb_chain], eax
+    mov  eax, [r8 + 12]
+    mov  [cb_k], eax
+    call write_jmp_end
+    call write_label_next
+    call write_comment_else
+    call expect_colon_end
+    call top_frame
+    mov  byte [r8 + 16], BK_ELSE
+    mov  dword [r8 + 4], BODY_UNSET
+    jmp  .stmt_done
+.err_else_no_if:
+    mov  bx, ERR_ELSE_NO_IF
+    jmp  error
+
+; ---- while / until / for -------------------------------------------------------------
+; while A < B:            until A < B:               for i = N:
+;   lp_n_top:               lp_n_top:                  <N into rax>  mov [lp_n_tgt], rax   (N is evaluated once)
+;     <cond>, jump to         <cond>, jump to        lp_n_top:
+;     if_n_1 when FALSE       if_n_1 when TRUE         cmp [v_i], [lp_n_tgt] / je if_n_1
+;     ...body...              ...body...               ...body...
+;     jmp lp_n_top            jmp lp_n_top             i moves one step toward N (+1 or -1), jmp lp_n_top
+;   if_n_1:                 if_n_1:                  if_n_1:
+.while_stmt:
+    mov  byte [cond_neg], 0
+    jmp  .loop_common
+.until_stmt:
+    mov  byte [cond_neg], 1
+.loop_common:
+    inc  dword [chain_ctr]
+    mov  eax, [chain_ctr]
+    mov  [cb_chain], eax
+    mov  dword [cb_k], 1
+    mov  eax, r14d
+    call write_comment_loop     ; "; while" / "; until", then  lp_n_top:
+    call write_loop_top
+    call parse_condition
+    call expect_colon_end
+    mov  al, BK_LOOP
+    call push_frame
+    jmp  .stmt_done
+.for_stmt:
+    inc  dword [chain_ctr]
+    mov  eax, [chain_ctr]
+    mov  [cb_chain], eax
+    mov  dword [cb_k], 1
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .err_invalid_var
+    call read_ident             ; the loop variable: a declared num
+    test rcx, rcx
+    jz   .err_invalid_var
+    mov  [fo_name], rdi
+    mov  [fo_len], rcx
+    call find_var
     test rax, rax
-    jz   .func_logic            ; TODO: unknown name -> new variable / function call / syntax error
-    ; TODO: emit a load of the variable through the writer
-    jmp  .func_logic
+    jz   .err_unknown_name
+    movzx eax, byte [rax + 1]
+    and  eax, VAR_TYPE_MASK
+    jnz  .err_wrong_type
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .err_invalid_var
+    cmp  byte [rsi], '='
+    jne  .err_invalid_var
+    inc  rsi
+    call write_comment_for
+    call write_for_decl
+    call parse_cmp_operand      ; the target: a number, a num variable, s.length ...
+    test al, al
+    jnz  .err_wrong_type
+    call write_for_head
+    call expect_colon_end
+    mov  al, BK_FOR
+    call push_frame
+    jmp  .stmt_done
+.err_unknown_name:
+    mov  bx, ERR_UNKNOWN_VAR
+    jmp  error
+.err_wrong_type:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+
+.as_variable:                   ; a name: at the start of a line it may be  x = ...  x += ...  x -= ...
+    test r14d, r14d
+    jnz  .func_logic            ; inside a statement that is not compiled yet
+    cmp  byte [bl_first], 0
+    je   .func_logic
+    mov  [as_name], rdi
+    mov  [as_len], rcx
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .func_logic
+    mov  al, [rsi]
+    cmp  al, '='
+    je   .as_eq
+    cmp  al, '+'
+    je   .as_plus
+    cmp  al, '-'
+    jne  .func_logic
+    mov  byte [as_kind], 2
+    jmp  .as_op2
+.as_plus:
+    mov  byte [as_kind], 1
+.as_op2:                        ; "+=" / "-="
+    lea  rax, [rsi + 1]
+    cmp  rax, r12
+    jae  .func_logic
+    cmp  byte [rsi + 1], '='
+    jne  .func_logic
+    add  rsi, 2
+    jmp  .as_go
+.as_eq:                         ; "=" but not "=="
+    mov  byte [as_kind], 0
+    lea  rax, [rsi + 1]
+    cmp  rax, r12
+    jae  .as_eq1
+    cmp  byte [rsi + 1], '='
+    je   .func_logic
+.as_eq1:
+    inc  rsi
+.as_go:
+    mov  rdi, [as_name]
+    mov  rcx, [as_len]
+    call find_var
+    test rax, rax
+    jz   .err_unknown_name
+    mov  r14d, FN_ASSIGN
+    mov  rdi, [as_name]
+    mov  rcx, [as_len]
+    call note_stmt
+    call parse_assign
+    jmp  .stmt_done
 
 .err_invalid_var:
     mov  bx, ERR_INVALID_VAR_SYNTAX
@@ -385,11 +763,15 @@ compile:
     jmp  error
 .ok:
     test r14d, r14d
-    jz   .finish
+    jz   .close_blocks
     call write_current_func     ; last statement had no trailing newline
+.close_blocks:
+    call close_all_blocks       ; end of file ends every open block
 .finish:
     call purge_tvars            ; temporaries die with the script
     call out_end                ; footer, then write <input>.nasm
+    call print_summary          ; "nlang: done - N statements, ..."
+    call print_ok               ; "nlang: wrote <file> (N bytes)"
     ; TODO: also call purge_tvars when a `def` body / block ends (scopes aren't parsed yet)
     xor  eax, eax
     add  rsp, 32
@@ -407,13 +789,323 @@ compile:
 
 ; ---- helpers ----------------------------------------------------------------
 
-; Exit with 0x100 + BX. Aligns the stack itself so it is safe from any depth.
+; Report the error, then exit with 0x100 + BX. Aligns the stack itself so it is
+; safe from any depth. (RSI is still compile's cursor, which gives the line.)
 error:
-    movzx ecx, bx
-    add  ecx, 0x100
+    movzx eax, bx
+    add  eax, 0x100
+    mov  [err_code], eax
     and  rsp, -16
     sub  rsp, 32
+    call print_error
+    mov  ecx, [err_code]
     call ExitProcess
+
+%macro PUT 1
+    lea  rdx, [%1]
+    mov  ecx, %1_len
+    call put_text
+%endmacro
+
+; "nlang: error 0x10b (line 2): name is already declared"  -> stderr
+print_error:
+    mov  dword [mb_len], 0
+    PUT  s_msg_err
+    mov  eax, [err_code]
+    call put_hex3
+    mov  eax, [err_code]
+    cmp  eax, 0x100 + ERR_OUTPUT_FULL    ; these two are not about a line of the source
+    je   .no_line
+    cmp  eax, 0x100 + ERR_WRITE_FAILED
+    je   .no_line
+    cmp  eax, 0x100 + ERR_UTF16
+    je   .no_line
+    PUT  s_msg_line
+    call count_line
+    call put_dec
+    PUT  s_msg_end
+    jmp  .text
+.no_line:
+    mov  ecx, 2                          ; ": "
+    lea  rdx, [s_msg_end + 1]
+    call put_text
+.text:
+    mov  eax, [err_code]
+    sub  eax, 0x100 + 5                  ; index into err_msgs
+    cmp  eax, ERR_COUNT
+    jae  .done
+    lea  rdx, [err_msgs]
+.skip:
+    test eax, eax
+    jz   .found
+    movzx ecx, byte [rdx]
+    lea  rdx, [rdx + rcx + 1]
+    dec  eax
+    jmp  .skip
+.found:
+    movzx ecx, byte [rdx]
+    inc  rdx
+    call put_text
+.done:
+    PUT  s_msg_nl
+    mov  ecx, -12                        ; STD_ERROR_HANDLE
+    lea  rdx, [msg_buf]
+    mov  r8d, [mb_len]
+    jmp  print_text
+
+; "nlang: wrote <output file>"  -> stdout
+print_ok:
+    mov  dword [mb_len], 0
+    PUT  s_msg_wrote
+    lea  rdx, [out_path]
+    xor  ecx, ecx
+.len:
+    cmp  byte [rdx + rcx], 0
+    je   .got
+    inc  ecx
+    jmp  .len
+.got:
+    call put_text
+    PUT  s_msg_open
+    mov  rax, [out_len]
+    call put_dec
+    PUT  s_msg_bytes
+    PUT  s_msg_close
+    jmp  flush_stdout
+
+; send msg_buf to stdout
+flush_stdout:
+    mov  ecx, -11                        ; STD_OUTPUT_HANDLE
+    lea  rdx, [msg_buf]
+    mov  r8d, [mb_len]
+    jmp  print_text
+
+; "nlang: compiling .\script.n (2314 bytes)"   (", package file" for a .ns)
+print_start:
+    mov  dword [mb_len], 0
+    PUT  s_msg_comp
+    lea  rdx, [path_buf]
+    xor  ecx, ecx
+.len:
+    cmp  byte [rdx + rcx], 0
+    je   .got
+    inc  ecx
+    jmp  .len
+.got:
+    call put_text
+    PUT  s_msg_open
+    mov  rax, [bytes_read]
+    call put_dec
+    PUT  s_msg_bytes
+    cmp  byte [is_ns], 0
+    je   .close
+    PUT  s_msg_pkg
+.close:
+    PUT  s_msg_close
+    jmp  flush_stdout
+
+; "nlang: done - 31 statements (2 not compiled yet), 24 names declared"
+print_summary:
+    mov  dword [mb_len], 0
+    PUT  s_msg_done
+    mov  eax, [stmt_count]
+    call put_dec
+    PUT  s_msg_stmts
+    cmp  dword [skip_count], 0
+    je   .names
+    PUT  s_msg_open
+    mov  eax, [skip_count]
+    call put_dec
+    PUT  s_msg_skipd
+.names:
+    PUT  s_msg_comma
+    movzx eax, byte [r15]                ; variables + lists left in the table
+    call put_dec
+    PUT  s_msg_names
+    PUT  s_msg_nl
+    jmp  flush_stdout
+
+; A statement starts (R14D = FN_* flag, RDI = keyword, RSI just past it). Count it;
+; with -v also show it:   "  [12] var num a = 5"   (+ "(not compiled yet)" if so)
+; Preserves every register compile uses.
+note_stmt:
+    inc  dword [stmt_count]
+    mov  byte [ns_flag], 0
+    cmp  r14d, FN_VAR
+    je   .compiled
+    cmp  r14d, FN_TVAR
+    je   .compiled
+    cmp  r14d, FN_LISTDECL
+    je   .compiled
+    cmp  r14d, FN_LISTOP
+    je   .compiled
+    cmp  r14d, FN_IF
+    je   .compiled
+    cmp  r14d, FN_ELIF
+    je   .compiled
+    cmp  r14d, FN_ELSE
+    je   .compiled
+    cmp  r14d, FN_ASSIGN
+    je   .compiled
+    cmp  r14d, FN_WHILE
+    je   .compiled
+    cmp  r14d, FN_UNTIL
+    je   .compiled
+    cmp  r14d, FN_FOR
+    je   .compiled
+    inc  dword [skip_count]
+    mov  byte [ns_flag], 1
+.compiled:
+    cmp  byte [verbose], 0
+    je   .ret
+    push rbx                             ; 5 pushes: keeps rsp 16-byte aligned for the calls
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov  dword [mb_len], 0
+    PUT  s_msg_ind
+    call count_line                      ; EAX = line number of RSI
+    call put_dec
+    PUT  s_msg_rb
+    lea  rbx, [buffer]
+    mov  rdx, rdi
+.back:                                   ; start of this line
+    cmp  rdx, rbx
+    jbe  .start
+    cmp  byte [rdx - 1], 0x0A
+    je   .start
+    dec  rdx
+    jmp  .back
+.start:
+    cmp  rdx, rdi                        ; skip indentation
+    jae  .indented
+    cmp  byte [rdx], ' '
+    je   .skip_one
+    cmp  byte [rdx], 0x09
+    jne  .indented
+.skip_one:
+    inc  rdx
+    jmp  .start
+.indented:
+    mov  rcx, rsi                        ; end of this line
+.fwd:
+    cmp  rcx, r12
+    jae  .end
+    cmp  byte [rcx], 0x0A
+    je   .end
+    cmp  byte [rcx], 0x0D
+    je   .end
+    inc  rcx
+    jmp  .fwd
+.end:
+    sub  rcx, rdx                        ; length of the line text
+    cmp  rcx, 100
+    jbe  .show
+    mov  ecx, 100                        ; long lines are cut
+.show:
+    call put_text
+    cmp  byte [ns_flag], 0
+    je   .eol
+    PUT  s_msg_todo
+.eol:
+    PUT  s_msg_nl
+    call flush_stdout
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+    pop  rbx
+.ret:
+    ret
+
+; in: ECX = -11 (stdout) / -12 (stderr), RDX = text, R8D = length.  Result ignored.
+print_text:
+    sub  rsp, 40                ; entry rsp is 8 mod 16: 32 shadow + 1 stack arg keeps calls aligned
+    mov  [pt_ptr], rdx
+    mov  [pt_len], r8
+    call GetStdHandle
+    mov  rcx, rax
+    mov  rdx, [pt_ptr]
+    mov  r8d, [pt_len]
+    lea  r9, [pt_written]
+    mov  qword [pt_written], 0
+    mov  qword [rsp + 32], 0
+    call WriteFile
+    add  rsp, 40
+    ret
+
+; append RDX/ECX (text, length) to msg_buf
+put_text:
+    lea  r9, [msg_buf]
+    mov  r8d, [mb_len]
+    add  r9, r8
+    xor  eax, eax
+.l: cmp  eax, ecx
+    jae  .d
+    mov  r10b, [rdx + rax]
+    mov  [r9 + rax], r10b
+    inc  eax
+    jmp  .l
+.d: add  [mb_len], ecx
+    ret
+
+put_dec:                        ; EAX as decimal
+    mov  eax, eax
+    lea  r9, [pd_buf + 24]
+    mov  r10, r9
+    mov  ecx, 10
+.d: xor  edx, edx
+    div  rcx
+    add  dl, '0'
+    dec  r9
+    mov  [r9], dl
+    test rax, rax
+    jnz  .d
+    mov  rdx, r9
+    mov  rcx, r10
+    sub  rcx, r9
+    jmp  put_text
+
+put_hex3:                       ; low 12 bits of EAX as 3 hex digits
+    lea  r9, [hex_digits]
+    lea  r10, [hx_buf]
+    mov  edx, eax
+    shr  edx, 8
+    and  edx, 15
+    mov  dl, [r9 + rdx]
+    mov  [r10], dl
+    mov  edx, eax
+    shr  edx, 4
+    and  edx, 15
+    mov  dl, [r9 + rdx]
+    mov  [r10 + 1], dl
+    and  eax, 15
+    mov  al, [r9 + rax]
+    mov  [r10 + 2], al
+    mov  rdx, r10
+    mov  ecx, 3
+    jmp  put_text
+
+; line of the source RSI points into (1-based), capped at the end of the input
+count_line:
+    lea  rdx, [buffer]
+    mov  r8, [bytes_read]
+    add  r8, rdx
+    mov  r9, rsi
+    cmp  r9, r8
+    jbe  .go
+    mov  r9, r8
+.go:
+    mov  eax, 1
+.l: cmp  rdx, r9
+    jae  .d
+    cmp  byte [rdx], 0x0A
+    jne  .n
+    inc  eax
+.n: inc  rdx
+    jmp  .l
+.d: ret
 
 ; in: AL   out: EAX = 1 if AL is one of [A-Za-z0-9_.], else 0
 ident_char:
@@ -742,10 +1434,20 @@ parse_var_decl:
     inc  rsi
     call skip_blanks
     mov  byte [vd_has_init], 1
+    mov  [ex_start], rsi
     cmp  byte [vd_type], 2
-    je   .literal               ; lstr takes a string literal only
+    jne  .not_lstr
     cmp  rsi, r12
-    jae  .literal               ; (the literal parsers report the missing value)
+    jae  .literal               ; (the literal parser reports the missing value)
+    mov  al, [rsi]
+    cmp  al, "'"
+    je   .literal
+    cmp  al, '"'
+    je   .literal
+    jmp  .do_expr               ; lstr: anything but a plain literal is an expression
+.not_lstr:
+    cmp  rsi, r12
+    jae  .literal
     mov  al, [rsi]
     call is_ident_start
     test eax, eax
@@ -755,19 +1457,62 @@ parse_var_decl:
     jne  .init_str
     call parse_number
     mov  [vd_value], rax
-    jmp  .end_check
+    jmp  .chk_op
 .expr:
     call parse_value_expr       ; var, s.length, s[#], list.x.length, list.x[#]
+    mov  [cmp_tmp], al
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .plain
+    mov  dl, [rsi]
+    cmp  dl, '+'
+    je   .rewind
+    cmp  dl, ','
+    je   .rewind
+.plain:
+    mov  al, [cmp_tmp]
     cmp  al, [vd_type]
+    je   .k1
+    cmp  byte [vd_type], 1      ; the only copy between types: lstr -> str (fit checked at run time)
     jne  .mismatch
+    cmp  al, 2
+    jne  .mismatch
+.rewind:
+    mov  rsi, [ex_start]
+    jmp  .do_expr
+.k1:
     mov  byte [vd_init_kind], 1
     jmp  .end_check
 .init_str:
     call parse_string_lit
     cmp  byte [vd_type], 2
-    je   .end_check
+    je   .chk_op
     call pack_str_lit           ; str: up to 8 chars in a qword, first char lowest
     mov  [vd_value], rax
+.chk_op:                        ; a literal followed by + or , is the start of an expression
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .end_check
+    mov  al, [rsi]
+    cmp  al, '+'
+    je   .rewind
+    cmp  al, ','
+    je   .rewind
+    jmp  .end_check
+.do_expr:
+    call parse_expr             ; code that leaves the value in rax; AL = its type
+    mov  [ex_type], al
+    cmp  byte [vd_type], 0
+    jne  .dx_text
+    test al, al
+    jnz  .mismatch
+    jmp  .dx_ok
+.dx_text:
+    test al, al
+    jz   .mismatch
+.dx_ok:
+    mov  byte [vd_init_kind], 2
+    mov  qword [vd_lit_len], 0  ; an lstr starts empty; the code stores the value
 .end_check:                     ; nothing but a comment may follow
     call skip_blanks
     cmp  rsi, r12
@@ -1039,8 +1784,8 @@ parse_value_expr:
     cmp  byte [rsi], '['
     je   .str_idx
 .copy:
-    cmp  eax, 1
-    ja   .mismatch              ; only num and str can be copied
+    cmp  eax, 2
+    ja   .mismatch              ; num, str and lstr can be copied (lists can't)
     mov  [expr_type], al
     mov  byte [expr_kind], EX_COPY
     ret
@@ -1268,6 +2013,521 @@ add_var:
     ret
 .full:
     mov  bx, ERR_TABLE_FULL
+    jmp  error
+
+; ---- blocks: indentation, if / elif / else --------------------------------------
+; A block is the run of lines indented deeper than the statement that opens it (like Python).
+; Open blocks live on blk_stack, BLK_SIZE bytes each:
+;   +0  dword  indentation of the header line (the if / elif / else)
+;   +4  dword  indentation of the body (BODY_UNSET until its first line is seen)
+;   +8  dword  chain number; the generated labels are if_<chain>_<k> and if_<chain>_end
+;   +12 dword  k: number of the label the NEXT branch of the chain starts at
+;   +16 byte   BK_IF / BK_ELSE / BK_OPAQUE / BK_LOOP / BK_FOR
+;   +24 qword  for: the loop variable's name (in the source),  +32 qword: its length
+; Rules: a tab moves to the next multiple of 4 columns; blank and comment-only lines don't count;
+; a body may be empty; at the top level (no open block) any indentation is accepted; inside a
+; block every line has to line up with the body or with an enclosing block.
+
+; out: R8 = the innermost open block (blk_depth must be > 0). Clobbers EAX.
+top_frame:
+    mov  eax, [blk_depth]
+    dec  eax
+    imul eax, eax, BLK_SIZE
+    lea  r8, [blk_stack]
+    add  r8, rax
+    ret
+
+; in: AL = BK_*, [bl_w] = indentation of the header line, [cb_chain] / [cb_k]
+push_frame:
+    mov  r10b, al
+    mov  ecx, [blk_depth]
+    cmp  ecx, BLK_MAX
+    jae  .too_deep
+    imul ecx, ecx, BLK_SIZE
+    lea  r8, [blk_stack]
+    add  r8, rcx
+    mov  eax, [bl_w]
+    mov  [r8], eax
+    mov  dword [r8 + 4], BODY_UNSET
+    mov  eax, [cb_chain]
+    mov  [r8 + 8], eax
+    mov  eax, [cb_k]
+    mov  [r8 + 12], eax
+    mov  [r8 + 16], r10b
+    mov  rax, [fo_name]
+    mov  [r8 + 24], rax
+    mov  rax, [fo_len]
+    mov  [r8 + 32], rax
+    inc  dword [blk_depth]
+    ret
+.too_deep:
+    mov  bx, ERR_TOO_DEEP
+    jmp  error
+
+; Ends the innermost block: closes its if-chain in the output and pops it.
+finalize_top:
+    call top_frame
+    movzx eax, byte [r8 + 16]
+    cmp  eax, BK_OPAQUE
+    je   .pop
+    mov  ecx, [r8 + 8]
+    mov  [cb_chain], ecx
+    mov  ecx, [r8 + 12]
+    mov  [cb_k], ecx
+    mov  rcx, [r8 + 24]
+    mov  [fo_name], rcx
+    mov  rcx, [r8 + 32]
+    mov  [fo_len], rcx
+    cmp  eax, BK_LOOP
+    je   .loop_end
+    cmp  eax, BK_FOR
+    je   .for_end
+    cmp  eax, BK_IF
+    jne  .end_only
+    call write_label_next       ; no else followed: a failed last condition lands here
+.end_only:
+    call write_label_end
+.pop:
+    dec  dword [blk_depth]
+    ret
+.loop_end:                      ; back to the test, and the exit lands after it
+    call write_jmp_top
+    call write_label_next
+    jmp  .pop
+.for_end:
+    call write_for_step
+    call write_label_next
+    jmp  .pop
+
+close_all_blocks:
+    cmp  dword [blk_depth], 0
+    je   .done
+    call finalize_top
+    jmp  close_all_blocks
+.done:
+    ret
+
+; in: RDI = start of a token
+; out: EAX = indentation of its line (space = 1, tab = to the next multiple of 4), or -1 if anything
+;      other than blanks comes before the token on its line. Clobbers RCX, RDX, R8, R9.
+line_indent:
+    lea  rdx, [buffer]
+    mov  r8, rdi
+.back:
+    cmp  r8, rdx
+    jbe  .at_start
+    cmp  byte [r8 - 1], 0x0A
+    je   .at_start
+    dec  r8
+    jmp  .back
+.at_start:
+    cmp  r8, rdx
+    jne  .go
+    lea  r9, [rdx + 3]          ; a UTF-8 BOM at the very start of the file is not indentation
+    cmp  rdi, r9
+    jb   .go
+    cmp  word [rdx], 0xBBEF
+    jne  .go
+    cmp  byte [rdx + 2], 0xBF
+    jne  .go
+    add  r8, 3
+.go:
+    xor  eax, eax
+.scan:
+    cmp  r8, rdi
+    jae  .done
+    movzx ecx, byte [r8]
+    cmp  cl, ' '
+    je   .space
+    cmp  cl, 0x09
+    je   .tab
+    cmp  cl, 0x0D
+    je   .next
+    mov  eax, -1
+    ret
+.space:
+    inc  eax
+    jmp  .next
+.tab:
+    add  eax, 4
+    and  eax, -4
+.next:
+    inc  r8
+    jmp  .scan
+.done:
+    ret
+
+; A statement starts on a new line: [bl_w] = its indentation, [bl_kw] = its keyword (FN_*, 0 = none).
+; Ends the blocks that this line is no longer part of (emitting their closing labels) and checks the
+; indentation.  out: EAX = 1 when the line is an elif / else that continues the open if-chain.
+blocks_line_start:
+.loop:
+    cmp  dword [blk_depth], 0
+    je   .none                  ; top level: any indentation is fine
+    call top_frame              ; R8
+    mov  eax, [bl_w]
+    mov  edx, [r8 + 4]
+    cmp  edx, BODY_UNSET
+    jne  .has_body
+    cmp  eax, [r8]
+    jbe  .ended                 ; not indented deeper than its header: the block had no body
+    mov  [r8 + 4], eax          ; first line of the body: its indentation is the body's
+    jmp  .none
+.has_body:
+    cmp  eax, edx
+    je   .none                  ; an ordinary line of the body
+    ja   .bad_indent            ; deeper than the body, with nothing opening a block
+.ended:                         ; the body is over
+    cmp  eax, [r8]
+    ja   .bad_indent            ; between the header and the body: lines up with nothing
+    jb   .close                 ; less than the header: the whole block is over
+    mov  ecx, [bl_kw]           ; exactly as far in as the header
+    cmp  ecx, FN_ELIF
+    je   .chain
+    cmp  ecx, FN_ELSE
+    jne  .close
+.chain:
+    cmp  byte [r8 + 16], BK_IF
+    jne  .no_if                 ; after an else (or a while ...) there is nothing to continue
+    mov  eax, 1
+    ret
+.close:
+    call finalize_top
+    jmp  .loop
+.none:
+    xor  eax, eax
+    ret
+.bad_indent:
+    mov  bx, ERR_BAD_INDENT
+    jmp  error
+.no_if:
+    mov  bx, ERR_ELSE_NO_IF
+    jmp  error
+
+; ---- expressions: numbers and text --------------------------------------------------
+;   expr := term { ( '+' | ',' | ', ' ) term }          evaluated from left to right
+;   term := number | 'text' | variable | s.length | s[#] | list.x.length | list.x[#]
+;   +   two numbers: their sum.  Two texts (str / lstr): joined.
+;   ,   joins two texts, or a text and a number (the number becomes its decimal digits), with nothing between
+;   ,_  the same with a space between: a comma that is followed by a space or tab
+; Text is built in a runtime buffer (rt_sb); the result of a join is an lstr value (rax = its address).
+; Types: 0 num, 1 str (rax = up to 8 characters), 2 lstr (rax = address of [length][bytes]).
+
+; out: AL = type of the term; the generated code leaves its value in RAX
+parse_term:
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    mov  al, [rsi]
+    cmp  al, "'"
+    je   .str
+    cmp  al, '"'
+    je   .str
+    cmp  al, '-'
+    je   .num
+    mov  cl, al
+    sub  cl, '0'
+    cmp  cl, 9
+    jbe  .num
+    call is_ident_start
+    test eax, eax
+    jz   .syntax
+    call parse_value_expr
+    mov  [cmp_tmp], al
+    call write_expr
+    mov  al, [cmp_tmp]
+    ret
+.num:
+    call parse_number
+    mov  [cmp_imm], rax
+    call write_mov_rax_imm
+    xor  eax, eax
+    ret
+.str:
+    call parse_string_lit
+    cmp  qword [vd_lit_len], 8
+    ja   .long
+    call pack_str_lit
+    mov  [cmp_imm], rax
+    call write_mov_rax_imm
+    mov  eax, 1
+    ret
+.long:                          ; more than 8 characters: a constant lstr in the output
+    call write_lit_lstr
+    mov  eax, 2
+    ret
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
+; out: AL = type; code that leaves the value in RAX (see above)
+parse_expr:
+    call parse_term
+    mov  [ex_cur], al
+    mov  byte [ex_sb], 0
+    mov  byte [ex_pure], 0
+.loop:
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .done
+    mov  al, [rsi]
+    mov  byte [ex_space], 0
+    cmp  al, '+'
+    je   .plus
+    cmp  al, ','
+    jne  .done
+    mov  byte [ex_plus], 0
+    inc  rsi
+    cmp  rsi, r12
+    jae  .op
+    mov  al, [rsi]
+    cmp  al, ' '
+    je   .sp
+    cmp  al, 0x09
+    jne  .op
+.sp:
+    mov  byte [ex_space], 1
+    jmp  .op
+.plus:
+    mov  byte [ex_plus], 1
+    inc  rsi
+.op:
+    cmp  byte [ex_sb], 0
+    jne  .append
+    cmp  byte [ex_cur], 0
+    jne  .start_text
+    cmp  byte [ex_plus], 0
+    je   .start_num
+    call write_mov_rbx_rax      ; number + term
+    call parse_term
+    test al, al
+    jnz  .mismatch
+    call write_add_rbx
+    jmp  .loop
+.start_num:                     ; number , term  ->  text
+    mov  byte [ex_pure], 1
+.start_text:
+    call write_sb_start         ; the builder now holds the value so far
+    mov  byte [ex_sb], 1
+.append:
+    cmp  byte [ex_space], 0
+    je   .nospace
+    call write_sb_space
+.nospace:
+    call parse_term
+    cmp  byte [ex_plus], 0
+    je   .chk_pure
+    test al, al
+    jz   .mismatch              ; '+' needs text on both sides
+.chk_pure:
+    cmp  byte [ex_pure], 0
+    je   .do_app
+    mov  byte [ex_pure], 0
+    test al, al
+    jz   .mismatch              ; two numbers can't be joined with ','
+.do_app:
+    call write_sb_append        ; AL = type of the term
+    jmp  .loop
+.done:
+    cmp  byte [ex_sb], 0
+    je   .plain
+    call write_sb_result
+    mov  eax, 2
+    ret
+.plain:
+    movzx eax, byte [ex_cur]
+    ret
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+
+; x = expr / x += expr / x -= expr   ([as_name], [as_len], [as_kind]; RSI is just past the operator)
+parse_assign:
+    mov  rdi, [as_name]
+    mov  rcx, [as_len]
+    call find_var
+    movzx eax, byte [rax + 1]
+    and  eax, VAR_TYPE_MASK
+    cmp  eax, 2
+    ja   .mismatch              ; lists can't be assigned
+    mov  [st_type], al
+    mov  rax, [as_name]
+    mov  [st_name], rax
+    mov  rax, [as_len]
+    mov  [st_len], rax
+    call parse_expr
+    mov  [ex_type], al
+    call expect_end
+    movzx eax, byte [ex_type]
+    cmp  byte [st_type], 0
+    jne  .text_var
+    test eax, eax               ; a num variable takes a number
+    jnz  .mismatch
+    jmp  write_assign
+.text_var:
+    cmp  byte [as_kind], 2
+    je   .mismatch              ; -= is for numbers
+    test eax, eax
+    jz   .mismatch              ; str / lstr take text
+    jmp  write_assign
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+
+; ---- conditions -------------------------------------------------------------------
+; if / elif / while / until take ONE comparison:   operand  ==  !=  <  >  <=  >=  operand   or just  operand
+; (a number on its own means "not zero"). An operand is a number, a 'string', a variable, or
+; s.length  s[#]  list.x.length  list.x[#].  Numbers compare signed; strings only with == and !=;
+; lstr values and lists can't be compared. Combine several conditions with bool, not and / or.
+; The generated code jumps to the next branch when the condition is FALSE.
+
+; in: [cb_chain] / [cb_k] = label to jump to when the condition fails; RSI after the keyword
+parse_condition:
+    call parse_cmp_operand      ; AL = type, the value is left in RAX by the generated code
+    mov  [cmp_ltype], al
+    call write_mov_rbx_rax      ; keep the left value in RBX while the right one is computed
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .no_colon
+    mov  al, [rsi]
+    cmp  al, ':'
+    je   .truthy
+    cmp  al, 0x0A               ; "if x" and the line ends: the colon is what is missing
+    je   .no_colon
+    cmp  al, 0x0D
+    je   .no_colon
+    cmp  al, '#'
+    je   .no_colon
+    call parse_cmp_op
+    call parse_cmp_operand
+    cmp  al, [cmp_ltype]
+    jne  .mismatch
+    cmp  al, 1                  ; strings: only == and !=
+    jne  .emit
+    cmp  byte [cond_op], 2
+    ja   .bad_cmp
+.emit:
+    jmp  write_cmp_jump
+.truthy:                        ; "if x:" is "if x != 0:"
+    cmp  byte [cmp_ltype], 0
+    jne  .mismatch
+    mov  byte [cond_op], 2
+    mov  qword [cmp_imm], 0
+    call write_mov_rax_imm
+    jmp  write_cmp_jump
+.no_colon:
+    mov  bx, ERR_EXPECT_COLON
+    jmp  error
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+.bad_cmp:
+    mov  bx, ERR_BAD_COMPARE
+    jmp  error
+
+; One operand; the generated code leaves its value in RAX.  out: AL = type (0 num, 1 str)
+parse_cmp_operand:
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    mov  al, [rsi]
+    cmp  al, "'"
+    je   .str
+    cmp  al, '"'
+    je   .str
+    cmp  al, '-'
+    je   .num
+    mov  cl, al
+    sub  cl, '0'
+    cmp  cl, 9
+    jbe  .num
+    call is_ident_start
+    test eax, eax
+    jz   .syntax
+    call parse_value_expr       ; variable, s.length, s[#], list.x.length, list.x[#]
+    mov  [cmp_tmp], al
+    cmp  al, 2
+    je   .lstr_cmp              ; an lstr can't be compared
+    call write_expr
+    mov  al, [cmp_tmp]
+    ret
+.lstr_cmp:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+.num:
+    call parse_number
+    mov  [cmp_imm], rax
+    call write_mov_rax_imm
+    xor  eax, eax
+    ret
+.str:
+    call parse_string_lit
+    call pack_str_lit
+    mov  [cmp_imm], rax
+    call write_mov_rax_imm
+    mov  eax, 1
+    ret
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
+parse_cmp_op:                   ; -> cond_op
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    movzx eax, byte [rsi]
+    inc  rsi
+    cmp  al, '='
+    je   .eq
+    cmp  al, '!'
+    je   .ne
+    cmp  al, '<'
+    je   .lt
+    cmp  al, '>'
+    je   .gt
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.eq:
+    mov  byte [cond_op], 1
+    jmp  .need_eq
+.ne:
+    mov  byte [cond_op], 2
+.need_eq:                       ; "==" and "!=": the second character has to be '='
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], '='
+    jne  .syntax
+    inc  rsi
+    ret
+.lt:
+    mov  byte [cond_op], 3
+    mov  cl, 5
+    jmp  .maybe_eq
+.gt:
+    mov  byte [cond_op], 4
+    mov  cl, 6
+.maybe_eq:                      ; "<=" / ">="
+    cmp  rsi, r12
+    jae  .done
+    cmp  byte [rsi], '='
+    jne  .done
+    inc  rsi
+    mov  [cond_op], cl
+.done:
+    ret
+
+; the rest of an if / elif / else line: ':' and then nothing (a comment is fine)
+expect_colon_end:
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .no
+    cmp  byte [rsi], ':'
+    jne  .no
+    inc  rsi
+    jmp  expect_end
+.no:
+    mov  bx, ERR_EXPECT_COLON
     jmp  error
 
 ; Removes every temporary variable (type bit 7) from the table and compacts the
