@@ -1,0 +1,10 @@
+# This is the SHA-256 hasher for the core Nano language.
+# It is used primarily for ensuring the security of injected packages.
+# It is written in Nano for readability.
+
+class sha256(in):
+    var lstr __in = b\in
+    # This is the padding step. We start by appending a 1 to the end of the input's bit data, zero-extending the string to be 64 bits shy of the next multiple of 512, and using the final 64 bits represent the original length of the string as an integer.
+    var int __length = __in.length
+    var int __counter
+    until __counter >
