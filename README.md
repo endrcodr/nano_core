@@ -6,5 +6,6 @@ Once you're familiar with Python, open '1. Get Started.txt' and 'example_script.
 
 # Requirements:
 NASM assembler, and a computer running Windows 11. We are currently working on a Linux port, and hope to soon come out with our own OS with this compiler built-in.
+We are also working on creating a full, preassembled release in the alpha stage, with the basic functionality a coding language needs. You will soon be able to download a functional executable directly, making it easier for users to get a working compiler.
 
 *The code for the Nano Project has been coded for humans, by humans. Suggestions containing convoluted, obfuscated, or otherwise hidden or overly complex code will not be considered for the main branch. AI-generated code is not allowed unless tested and reviewed by an experienced human.*
