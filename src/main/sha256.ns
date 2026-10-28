@@ -3,8 +3,20 @@
 # It is written in Nano for readability.
 
 class sha256(in):
-    var lstr __in = b\in
+    var bin __in = in
+    __in = __in,1
     # This is the padding step. We start by appending a 1 to the end of the input's bit data, zero-extending the string to be 64 bits shy of the next multiple of 512, and using the final 64 bits represent the original length of the string as an integer.
     var int __length = __in.length
-    var int __counter
-    until __counter >
+    var int __counter = 512
+    var __temp = __in
+    until __counter >> __length:
+        __counter += 512
+    for i = __counter - 64:
+       __temp = __temp,0
+    __temp = __temp,b\__length
+    # This is the splitting step. We split the input into 512-bit blocks for processing each block individually later.
+    list __blocks
+    tvar int __i
+    until __i = __temp.length:
+        
+        __i += 512
