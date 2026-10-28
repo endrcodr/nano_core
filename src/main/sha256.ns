@@ -1,6 +1,7 @@
 # This is the SHA-256 hasher for the core Nano language.
 # It is used primarily for ensuring the security of injected packages.
 # It is written in Nano for readability.
+# It is required for the Nano compiler to compile any other programs.
 
 class sha256(in):
     var bin __in = in
@@ -16,7 +17,14 @@ class sha256(in):
     __temp = __temp,b\__length
     # This is the splitting step. We split the input into 512-bit blocks for processing each block individually later.
     list __blocks
-    tvar int __i
     until __i = __temp.length:
-        
+        __blocks.append(__temp[__i:__i + 511]
         __i += 512
+    list __words
+    tvar int __n
+    tvar int __i
+    for __b = __blocks.length:
+        __words.append(__blocks[__b][__i * 16 + __n]
+        __n += 1
+        __i += 16
+    
