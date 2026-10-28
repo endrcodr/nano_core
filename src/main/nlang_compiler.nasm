@@ -28,7 +28,14 @@ FN_FS     equ 13
 FN_TVAR   equ 14                ; like FN_VAR, but the variable is temporary
 FN_LISTDECL equ 15              ; list num|str name
 FN_LISTOP   equ 16              ; list.name.append / insert / remove / clear / sort
-FN_ASSIGN   equ 17              ; x = expr / x += expr / x -= expr
+FN_ASSIGN   equ 17              ; x = expr / x += expr / x -= expr / name(args)
+FN_RET      equ 18              ; ret [value]
+FN_MAX      equ 64              ; functions per program
+FN_SIZE     equ 160             ; bytes per function record (see "functions" below)
+MAX_PARAMS  equ 8
+CA_MAX      equ 128             ; text (lstr) arguments in the whole program
+BIN_BYTES   equ 4096            ; bytes of bits a bin can hold (BIN_BYTES in the generated code)
+BIN_BITS    equ 32768
 LSTR_MAX    equ 4096            ; bytes of text an lstr can hold (LSTR_CAP in the generated code)
 
 ; ---- open blocks (if / elif / else / while / until / for, and def which is not compiled yet) ----
@@ -40,6 +47,7 @@ BK_ELSE    equ 2                ; in an else branch
 BK_OPAQUE  equ 3                ; def body (compiled later)
 BK_LOOP    equ 4                ; while / until body
 BK_FOR     equ 5                ; for body
+BK_DEF     equ 6                ; def body
 
 ; ---- variable type byte -----------------------------------------------------
 VAR_TEMP      equ 0x80          ; bit 7 set = temporary (tvar), removed by purge_tvars
@@ -53,6 +61,8 @@ EX_LSTR_LEN equ 4               ; l.length         (l is an lstr)
 EX_LSTR_IDX equ 5               ; l[#]
 EX_LIST_LEN equ 6               ; list.x.length
 EX_LIST_IDX equ 7               ; list.x[#]
+EX_BIN_LEN  equ 8               ; b.length (bits)
+EX_BIN_IDX  equ 9               ; b[#]     (bit number # counted from the least significant end)
 
 ; ---- list statements: ls_op ---------------------------------------------------
 LS_APPEND equ 1
@@ -89,7 +99,13 @@ ERR_BAD_INDENT         equ 23   ; indentation matches no open block
 ERR_BAD_COMPARE        equ 24   ; strings can only be compared with == and !=
 ERR_TOO_DEEP           equ 25   ; more than BLK_MAX blocks nested
 ERR_LSTR_TOO_BIG       equ 26   ; text longer than LSTR_MAX
-ERR_COUNT              equ 22   ; number of messages in err_msgs (codes 5..26)
+ERR_DEF_NESTED         equ 27   ; def inside a block
+ERR_RET_TYPE           equ 28   ; value of a function used before its type is known
+ERR_ARG_COUNT          equ 29   ; wrong number of arguments
+ERR_RET_OUTSIDE        equ 30   ; ret outside a def
+ERR_BIN_TOO_BIG        equ 31   ; bin literal longer than BIN_BITS
+ERR_BIN_LOCAL          equ 32   ; bin variable inside a def
+ERR_COUNT              equ 28   ; number of messages in err_msgs (codes 5..30)
 
 VAR_TABLE_SIZE equ 0x10000
 
@@ -184,6 +200,33 @@ section .bss
     ex_plus     resb 1              ; the operator being parsed is '+' (otherwise ',')
     ex_space    resb 1              ; ', ' joins with a space
     ex_pure     resb 1              ; a ',' started from a number: the right side has to be text
+    ex_hint     resb 1              ; 1 = the next parse_expr reads 0x... literals as bits (set by the caller)
+    ex_binctx   resb 1              ; ... and while the value so far is a bin
+    ex_bin      resb 1              ; 1 = the value so far is in rt_bacc (a bit operation was done)
+    ex_op       resb 1              ; the bit operation being parsed
+    bin_bits    resq 1              ; a bin literal being built: its length
+    bin_buf     resb BIN_BYTES + 8  ; ... and its bits
+    ex_noc      resb 1              ; 1 = inside call arguments: a ',' ends the expression (it separates arguments)
+    scope_cnt   resb 1              ; number of variables when the current def began
+    w_rt        resb 1
+    resb 5
+    fv_hit      resq 1
+    scope_lo    resq 1              ; variables at or above this address belong to the def being compiled (0 = none)
+    cur_fn      resq 1              ; record of the def being compiled (0 = top level)
+    call_fn     resq 1              ; the function a call refers to
+    w_fn        resq 1              ; writer: the function being called
+    cur_fn_id   resd 1
+    fn_ids      resd 1              ; functions seen so far: their number is used in the labels
+    fn_count    resd 1
+    call_ctr    resd 1              ; call sites so far
+    w_id        resd 1
+    w_site      resd 1
+    w_idx       resd 1
+    w_ci        resd 1
+    ca_n        resd 1
+    resd 1
+    fn_table    resb FN_MAX * FN_SIZE
+    ca_tab      resd CA_MAX
     cmp_imm     resq 1              ; literal operand
     tk_ptr      resq 1              ; the token being looked at (saved across calls that clobber RDI / RCX)
     tk_len      resq 1
@@ -209,6 +252,7 @@ kw_table:
     KW "for",    FN_FOR
     KW "bool",   FN_BOOL
     KW "def",    FN_DEF
+    KW "ret",    FN_RET
     KW "import", FN_IMPORT
     db 0
 ; "mem." and "fs." families are matched by prefix in match_keyword.
@@ -250,6 +294,12 @@ err_msgs:
     MSG "strings can only be compared with == and !="           ; 24
     MSG "blocks are nested too deeply (32 levels at most)"      ; 25
     MSG "text is longer than 4096 bytes (the lstr limit)"       ; 26
+    MSG "def is only allowed at the top level (not inside a block)" ; 27
+    MSG "the return type is not known yet: put a ret with a value first, or write it in the header: def f (num n) num:" ; 28
+    MSG "wrong number of arguments"                             ; 29
+    MSG "ret outside of a def"                                  ; 30
+    MSG "binary literal is longer than 32768 bits"              ; 31
+    MSG "bin variables can only be declared outside a def (they can still be used inside one)" ; 32
 
 STR s_msg_err,  "nlang: error 0x"
 STR s_msg_line, " (line "
@@ -281,9 +331,8 @@ section .text
 ; while ### % ###: - Loop that continues until a condition is not met
 ; until ### % ###: - Loop that continues until a contition is met
 ; for @ = *: - Loop that continues until a value, here represented as an @, is equal to a number, represented as an *.
-; var num/str/lstr/bin @@@ [= *] - Defines a variable. Its name is represented here as '@@@', and the brackets show an optional way of defining the variable immediately. Otherwise, the variable is initialized to 0 or '0'. Num sets the variable type to a number. Str sets the variable type to a string, at most 8 characters. Lstr sets the variable type to a long string, using RAM space to store the value. Lstr variables are slower, but can contain much more data at once. Bin variables hold binary data.
-; tvar num/str/lstr/bin @@@ [= *] - Defines a temporary variable. Its name is represented here as '@@@', and the brackets show an optional way of defining the variable immediately. Otherwise, the variable is initialized to 0 or '0'. Num sets the variable type to a number. Str sets the variable type to a string, at most 8 characters. Lstr sets the variable type to a long string, using RAM space to store the value. Lstr variables are slower, but can contain much more data at once. Bin variables hold binary data. Temporary variables only exist in the compiled variable table for the duration of the active function, script, or function.
-; int(###) - Used when declaring a number variable's value, to convert numerical values inside a string to a number variable.
+; var num/str/lstr @@@ [= *] - Defines a variable. Its name is represented here as '@@@', and the brackets show an optional way of defining the variable immediately. Otherwise, the variable is initialized to 0 or '0'. Num sets the variable type to a number. Str sets the variable type to a string, at most 8 characters. Lstr sets the variable type to a long string, using RAM space to store the value. Lstr variables are slower, but can contain much more data at once.
+; tvar num/str/lstr @@@ [= *] - Defines a temporary variable. Its name is represented here as '@@@', and the brackets show an optional way of defining the variable immediately. Otherwise, the variable is initialized to 0 or '0'. Num sets the variable type to a number. Str sets the variable type to a string, at most 8 characters. Lstr sets the variable type to a long string, using RAM space to store the value. Lstr variables are slower, but can contain much more data at once. Temporary variables only exist in the compiled variable table for the duration of the active function, script, or function.
 ; list functions - Functions that allow the user to manipulate lists, which are arrays of values. The functions are as follows:
 ; list num/str @@@ - Creates a list of values, named here as '@@@'. The list can be of numbers or strings, but not long strings. The list is stored in RAM, and entries can be accessed with the list.@@@[#] function.
 ; list.@@@[#] - Used to access a value in a list, where the list is named here as '@@@', and the index of the value is represented here as '#'.
@@ -297,6 +346,9 @@ section .text
 ; @@@.length - Returns the length of the string @@@.
 ; # - Used to mark a comment. Single hashes mean one line, every character of text after that point. Triple hashes mean a multi-line comment, which continues until the next triple hash.
 ; bool ### % ### - used to compute boolean functions seperately, used when defining a variable's value. The result is stored in the variable, and can be used later in the code.
+; var bin @@@ [= *] - Defines a binary variable: a string of bits (up to 32768) used directly as bits, not as text. Literals are 0b1010 (binary) and 0xF0 (4 bits per hex digit); x.length is the number of bits, x[#] is bit # (0 = least significant) as a num.
+; @ and @ / @ or @ / @ xor @ - Bitwise operations between bins; the shorter bin is padded with zeros on the left. Put 'not' before the operator to invert the result (nand, nor, xnor): a not and b. 'not a' flips every bit. Operations run left to right.
+; bin(n) / num(b) - Convert a num to a 64-bit bin / the lowest 64 bits of a bin to a num. == and != compare bins. In a text join a bin shows as 0b....
 ; def @@@ (args): - Defines a function. The name is represented here as '@@@', and arguments, however many are needed, are represented as 'args'. The function is called by using the name of the function, and passing in the arguments. The function can return a value, which can be used in the code.
 ; import @@@ - Imports the compiled code of another file to this location in this file. The name of the file is represented here as '@@@', and the file must be in the same directory as this file, in the defined directory, in the system's PATH, or from locations such as GitHub using its URL, then its file location. This allows projects built on a GitHub repository to be compiled and run without needing to manually download the new files, replace the file in the directory, and recompile the code, as opposed to simply recompiling the code.
 ; mem. functions - Functions that allow the user to manipulate memory, such as copying, moving, and deleting data. These functions are as follows:
@@ -543,8 +595,10 @@ compile:
     je   .until_stmt
     cmp  eax, FN_FOR
     je   .for_stmt
-    cmp  eax, FN_DEF            ; def is not compiled yet, but it opens a block: the lines under
-    je   .opaque
+    cmp  eax, FN_DEF
+    je   .def_stmt
+    cmp  eax, FN_RET
+    je   .ret_stmt
     jmp  .func_logic
 .opaque:
     mov  dword [cb_chain], 0
@@ -695,6 +749,98 @@ compile:
 .err_unknown_name:
     mov  bx, ERR_UNKNOWN_VAR
     jmp  error
+
+; ---- def / ret ----------------------------------------------------------------------
+.def_stmt:
+    cmp  dword [blk_depth], 0
+    jne  .err_def_nested
+    call parse_def_header
+    call expect_colon_end
+    mov  eax, [cur_fn_id]
+    mov  [cb_chain], eax
+    mov  dword [cb_k], 0
+    mov  al, BK_DEF
+    call push_frame
+    jmp  .stmt_done
+.err_def_nested:
+    mov  bx, ERR_DEF_NESTED
+    jmp  error
+.ret_stmt:
+    cmp  qword [cur_fn], 0
+    je   .err_ret_outside
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .ret_bare
+    mov  al, [rsi]
+    cmp  al, 0x0A
+    je   .ret_bare
+    cmp  al, 0x0D
+    je   .ret_bare
+    cmp  al, '#'
+    je   .ret_bare
+    call parse_expr
+    mov  [ex_type], al
+    cmp  al, 3
+    je   .err_wrong_type        ; (functions don't return a bin yet)
+    call expect_end
+    mov  r8, [cur_fn]
+    movzx eax, byte [r8 + 21]
+    cmp  eax, 2                 ; a function that returns an lstr takes a str too
+    jne  .ret_nw
+    cmp  byte [ex_type], 1
+    jne  .ret_nw
+    call write_str_to_sb
+    mov  byte [ex_type], 2
+    mov  r8, [cur_fn]
+    movzx eax, byte [r8 + 21]
+.ret_nw:
+    cmp  eax, 0xFF
+    jne  .ret_chk
+    mov  al, [ex_type]
+    mov  [r8 + 21], al          ; the first ret decides the type of the function
+    jmp  .ret_emit
+.ret_chk:
+    cmp  al, [ex_type]
+    jne  .err_wrong_type
+.ret_emit:
+    movzx eax, byte [ex_type]
+    call write_ret_value
+    jmp  .stmt_done
+.ret_bare:
+    mov  r8, [cur_fn]
+    movzx eax, byte [r8 + 21]
+    cmp  eax, 0xFF
+    jne  .rb1
+    mov  byte [r8 + 21], 0xFE   ; no value
+    jmp  .rb2
+.rb1:
+    cmp  eax, 0xFE
+    jne  .err_wrong_type
+.rb2:
+    call expect_end
+    call write_ret_void
+    jmp  .stmt_done
+.err_ret_outside:
+    mov  bx, ERR_RET_OUTSIDE
+    jmp  error
+
+; ---- a call as a statement: name(args) ---------------------------------------------
+.call_stmt:
+    mov  rdi, [as_name]
+    mov  rcx, [as_len]
+    call fn_find
+    test rax, rax
+    jz   .err_unknown_name      ; name( ... ) and no such function
+    mov  [call_fn], rax
+    inc  rsi                    ; past '('
+    mov  r14d, FN_ASSIGN
+    mov  rdi, [as_name]
+    mov  rcx, [as_len]
+    call note_stmt
+    mov  al, 1                  ; a call with no value is fine here
+    call parse_call
+    call expect_end
+    jmp  .stmt_done
 .err_wrong_type:
     mov  bx, ERR_TYPE_MISMATCH
     jmp  error
@@ -710,6 +856,8 @@ compile:
     cmp  rsi, r12
     jae  .func_logic
     mov  al, [rsi]
+    cmp  al, '('
+    je   .call_stmt
     cmp  al, '='
     je   .as_eq
     cmp  al, '+'
@@ -947,6 +1095,10 @@ note_stmt:
     cmp  r14d, FN_ELSE
     je   .compiled
     cmp  r14d, FN_ASSIGN
+    je   .compiled
+    cmp  r14d, FN_DEF
+    je   .compiled
+    cmp  r14d, FN_RET
     je   .compiled
     cmp  r14d, FN_WHILE
     je   .compiled
@@ -1204,8 +1356,8 @@ find_var:
     inc  r11
     cmp  r11, rcx
     jb   .cmp
-    mov  rax, rdx
-    ret
+    mov  [fv_hit], rdx          ; a match: keep looking, a later (local) one hides it
+    jmp  .skip
 .skip:
     lea  rdx, [rdx + 2 + r9]    ; -> value
     and  r10d, VAR_TYPE_MASK    ; ignore the temporary flag when sizing the record
@@ -1228,7 +1380,8 @@ find_var:
     dec  r8d
     jmp  .next
 .none:
-    xor  eax, eax
+    mov  rax, [fv_hit]
+    mov  qword [fv_hit], 0
     ret
 
 ; ---- var / tvar declarations ------------------------------------------------
@@ -1398,12 +1551,24 @@ parse_var_decl:
     mov  byte [vd_type], 0
     jmp  .got_type
 .try_str:
+    cmp  word [rdi], 'bi'
+    je   .try_bin
     cmp  word [rdi], 'st'
     jne  .bad_type
     cmp  byte [rdi + 2], 'r'
     jne  .bad_type
     mov  byte [vd_type], 1
     jmp  .got_type
+.try_bin:
+    cmp  byte [rdi + 2], 'n'
+    jne  .bad_type
+    cmp  qword [cur_fn], 0
+    jne  .bin_local
+    mov  byte [vd_type], 5
+    jmp  .got_type
+.bin_local:
+    mov  bx, ERR_BIN_LOCAL
+    jmp  error
 .try_lstr:
     cmp  rcx, 4
     jne  .bad_type
@@ -1436,6 +1601,11 @@ parse_var_decl:
     call skip_blanks
     mov  byte [vd_has_init], 1
     mov  [ex_start], rsi
+    cmp  byte [vd_type], 5
+    jne  .not_bin
+    mov  byte [ex_hint], 1      ; a bin: always an expression (0x... is read as bits)
+    jmp  .do_expr
+.not_bin:
     cmp  byte [vd_type], 2
     jne  .not_lstr
     cmp  rsi, r12
@@ -1449,10 +1619,27 @@ parse_var_decl:
 .not_lstr:
     cmp  rsi, r12
     jae  .literal
+    call at_bool                ; var num ok = bool a < b
+    test eax, eax
+    jz   .not_bool
+    mov  rsi, [ex_start]
+    jmp  .do_expr
+.not_bool:
     mov  al, [rsi]
     call is_ident_start
     test eax, eax
-    jnz  .expr
+    jz   .literal
+    call try_builtin            ; var num n = num(b)
+    test eax, eax
+    jz   .nb1
+    mov  rsi, [ex_start]
+    jmp  .do_expr
+.nb1:
+    call try_call               ; var num n = f(1, 2)
+    test eax, eax
+    jz   .expr
+    mov  rsi, [ex_start]
+    jmp  .do_expr
 .literal:
     cmp  byte [vd_type], 0
     jne  .init_str
@@ -1503,6 +1690,8 @@ parse_var_decl:
 .do_expr:
     call parse_expr             ; code that leaves the value in rax; AL = its type
     mov  [ex_type], al
+    cmp  byte [vd_type], 5
+    je   .dx_bin
     cmp  byte [vd_type], 0
     jne  .dx_text
     test al, al
@@ -1511,6 +1700,12 @@ parse_var_decl:
 .dx_text:
     test al, al
     jz   .mismatch
+    cmp  al, 3                  ; a bin is not text
+    je   .mismatch
+    jmp  .dx_ok
+.dx_bin:
+    cmp  al, 3
+    jne  .mismatch
 .dx_ok:
     mov  byte [vd_init_kind], 2
     mov  qword [vd_lit_len], 0  ; an lstr starts empty; the code stores the value
@@ -1563,6 +1758,14 @@ read_new_name:
     mov  [vd_name], rdi
     mov  [vd_len], rcx
     call find_var
+    test rax, rax
+    jz   .fn_chk
+    cmp  rax, [scope_lo]        ; a global can be hidden by a local of the same name
+    jae  .redeclared            ; (scope_lo is 0 at the top level: every match is a redeclaration)
+.fn_chk:
+    mov  rdi, [vd_name]
+    mov  rcx, [vd_len]
+    call fn_find
     test rax, rax
     jnz  .redeclared
     ret
@@ -1785,17 +1988,29 @@ parse_value_expr:
     cmp  byte [rsi], '['
     je   .str_idx
 .copy:
+    cmp  eax, 5
+    je   .copy_bin
     cmp  eax, 2
     ja   .mismatch              ; num, str and lstr can be copied (lists can't)
     mov  [expr_type], al
     mov  byte [expr_kind], EX_COPY
     ret
+.copy_bin:
+    mov  byte [expr_type], 3
+    mov  byte [expr_kind], EX_COPY
+    mov  eax, 3
+    ret
 .str_len:
     cmp  eax, 1
     je   .is_str_len
+    cmp  eax, 5
+    je   .is_bin_len
     cmp  eax, 2
     jne  .not_string
     mov  byte [expr_kind], EX_LSTR_LEN
+    jmp  .len_done
+.is_bin_len:
+    mov  byte [expr_kind], EX_BIN_LEN
     jmp  .len_done
 .is_str_len:
     mov  byte [expr_kind], EX_STR_LEN
@@ -1805,10 +2020,17 @@ parse_value_expr:
 .str_idx:
     cmp  eax, 1
     je   .is_str_idx
+    cmp  eax, 5
+    je   .is_bin_idx
     cmp  eax, 2
     jne  .not_string
     mov  byte [expr_kind], EX_LSTR_IDX
     jmp  .idx_done
+.is_bin_idx:
+    mov  byte [expr_kind], EX_BIN_IDX
+    call parse_index
+    xor  eax, eax               ; a bit is a number
+    ret
 .is_str_idx:
     mov  byte [expr_kind], EX_STR_IDX
 .idx_done:
@@ -2083,6 +2305,8 @@ finalize_top:
     je   .loop_end
     cmp  eax, BK_FOR
     je   .for_end
+    cmp  eax, BK_DEF
+    je   .def_end
     cmp  eax, BK_IF
     jne  .end_only
     call write_label_next       ; no else followed: a failed last condition lands here
@@ -2098,6 +2322,14 @@ finalize_top:
 .for_end:
     call write_for_step
     call write_label_next
+    jmp  .pop
+.def_end:                       ; the function's closing code; its parameters and locals go out of scope
+    call write_def_end
+    mov  al, [scope_cnt]
+    mov  [r15], al
+    mov  qword [cur_fn], 0
+    mov  dword [cur_fn_id], 0
+    mov  qword [scope_lo], 0
     jmp  .pop
 
 close_all_blocks:
@@ -2205,6 +2437,350 @@ blocks_line_start:
     mov  bx, ERR_ELSE_NO_IF
     jmp  error
 
+; ---- functions ------------------------------------------------------------------------
+;   def name (num a, str b, lstr c):      ...body...       ret [value]          name(args)
+; Function record (FN_SIZE bytes):  +0 name ptr  +8 name length  +16 id  +20 parameter count
+;   +21 return type (0 num, 1 str, 2 lstr, 0xFE nothing, 0xFF not known yet)  +22 parameter types (8)
+;   +32 parameter names: 8 x (ptr, length)
+; Parameters and everything declared in the body are local: they get their own storage (labels end in
+; @<id>) and go out of scope at the end of the def. A recursive call saves the storage of the running
+; call in a save area and restores it afterwards, so every call starts with its own variables.
+
+; in: RDI = name, RCX = length   out: RAX = record or 0   clobbers RDX, R8-R10
+fn_find:
+    mov  r8d, [fn_count]
+    lea  rdx, [fn_table]
+.next:
+    test r8d, r8d
+    jz   .none
+    cmp  [rdx + 8], rcx
+    jne  .skip
+    mov  r9, [rdx]
+    xor  r10d, r10d
+.cmp:
+    mov  al, [r9 + r10]
+    cmp  al, [rdi + r10]
+    jne  .skip
+    inc  r10
+    cmp  r10, rcx
+    jb   .cmp
+    mov  rax, rdx
+    ret
+.skip:
+    add  rdx, FN_SIZE
+    dec  r8d
+    jmp  .next
+.none:
+    xor  eax, eax
+    ret
+
+; in: RDI = type word, RCX = its length   out: AL = 0 num, 1 str, 2 lstr
+type_word:
+    cmp  rcx, 3
+    jne  .l4
+    cmp  word [rdi], 'nu'
+    jne  .s
+    cmp  byte [rdi + 2], 'm'
+    jne  .bad
+    xor  eax, eax
+    ret
+.s:
+    cmp  word [rdi], 'st'
+    jne  .bad
+    cmp  byte [rdi + 2], 'r'
+    jne  .bad
+    mov  eax, 1
+    ret
+.l4:
+    cmp  rcx, 4
+    jne  .bad
+    cmp  dword [rdi], 'lstr'
+    jne  .bad
+    mov  eax, 2
+    ret
+.bad:
+    mov  bx, ERR_BAD_VAR_TYPE
+    jmp  error
+
+; def NAME (type a, type b):     RSI is just past "def"
+parse_def_header:
+    call read_new_name          ; checks the name against variables (vd_name / vd_len)
+    mov  rdi, [vd_name]
+    mov  rcx, [vd_len]
+    call fn_find
+    test rax, rax
+    jnz  .redeclared
+    mov  eax, [fn_count]
+    cmp  eax, FN_MAX
+    jae  .full
+    imul eax, eax, FN_SIZE
+    lea  r8, [fn_table]
+    add  r8, rax
+    mov  rax, [vd_name]
+    mov  [r8], rax
+    mov  rax, [vd_len]
+    mov  [r8 + 8], rax
+    inc  dword [fn_count]
+    inc  dword [fn_ids]
+    mov  eax, [fn_ids]
+    mov  [r8 + 16], eax
+    mov  byte [r8 + 20], 0
+    mov  byte [r8 + 21], 0xFF
+    mov  [cur_fn], r8
+    mov  [cur_fn_id], eax
+    movzx eax, byte [r15]
+    mov  [scope_cnt], al        ; the variables that exist now stay; the ones added from here on are local
+    xor  ecx, ecx
+    call find_var               ; (no match: RDX = end of the variable table)
+    mov  [scope_lo], rdx
+    call write_def_begin
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], '('
+    jne  .syntax
+    inc  rsi
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ')'
+    jne  .param
+    inc  rsi
+    jmp  .after
+.param:
+    call skip_blanks
+    call read_ident
+    test rcx, rcx
+    jz   .syntax
+    call type_word
+    mov  [vd_type], al
+    call read_new_name
+    mov  byte [vd_temp], 0
+    mov  byte [vd_has_init], 0
+    mov  byte [vd_init_kind], 0
+    mov  qword [vd_value], 0
+    mov  qword [vd_lit_len], 0
+    mov  r8, [cur_fn]
+    movzx ecx, byte [r8 + 20]
+    cmp  ecx, MAX_PARAMS
+    jae  .full
+    mov  al, [vd_type]
+    mov  [r8 + 22 + rcx], al
+    mov  edx, ecx
+    shl  edx, 4
+    mov  rax, [vd_name]
+    mov  [r8 + 32 + rdx], rax
+    mov  rax, [vd_len]
+    mov  [r8 + 40 + rdx], rax
+    inc  byte [r8 + 20]
+    call add_var
+    call write_param_decl
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    mov  al, [rsi]
+    inc  rsi
+    cmp  al, ','
+    je   .param
+    cmp  al, ')'
+    jne  .syntax
+.after:                         ; optional return type:  def f (num n) num:
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .enter
+    mov  al, [rsi]
+    call is_ident_start
+    test eax, eax
+    jz   .enter
+    call read_ident
+    call type_word
+    mov  r8, [cur_fn]
+    mov  [r8 + 21], al
+.enter:
+    jmp  write_def_enter
+.redeclared:
+    mov  bx, ERR_REDECLARED
+    jmp  error
+.full:
+    mov  bx, ERR_TABLE_FULL
+    jmp  error
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
+; RSI is at a name. When it is a function followed by '(' : consume both, [call_fn] = the record, EAX = 1.
+; Otherwise nothing is consumed and EAX = 0.
+try_call:
+    push rsi
+    call read_ident
+    test rcx, rcx
+    jz   .no
+    call fn_find
+    test rax, rax
+    jz   .no
+    mov  [call_fn], rax
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .no
+    cmp  byte [rsi], '('
+    jne  .no
+    inc  rsi
+    add  rsp, 8
+    mov  eax, 1
+    ret
+.no:
+    pop  rsi
+    xor  eax, eax
+    ret
+
+; The arguments and the call itself.  in: [call_fn], RSI just past '(',  AL = 1 when the function may return
+; nothing (a call used as a statement).  out: AL = type of the value (the generated code leaves it in RAX)
+parse_call:
+    push rbp
+    movzx eax, al
+    push rax                    ; +104 allow
+    push qword [call_fn]        ; +96  the function
+    movzx eax, byte [ex_cur]
+    push rax                    ; +88
+    movzx eax, byte [ex_sb]
+    push rax                    ; +80
+    movzx eax, byte [ex_pure]
+    push rax                    ; +72
+    movzx eax, byte [ex_plus]
+    push rax                    ; +64
+    movzx eax, byte [ex_space]
+    push rax                    ; +56
+    movzx eax, byte [ex_noc]
+    push rax                    ; +48
+    movzx eax, byte [cond_op]
+    push rax                    ; +40
+    movzx eax, byte [cmp_ltype]
+    push rax                    ; +32
+    movzx eax, byte [cmp_tmp]
+    push rax                    ; +24
+    push qword [cmp_imm]        ; +16
+    inc  dword [call_ctr]
+    mov  eax, [call_ctr]
+    push rax                    ; +8   call site number
+    push 0                      ; +0   arguments so far
+    mov  rbp, rsp
+    mov  r8, [rbp + 96]
+    mov  [w_fn], r8
+    mov  eax, [rbp + 8]
+    mov  [w_site], eax
+    call write_call_begin       ; push rbx: the caller's left operand survives the call
+    cmp  qword [rbp + 80], 0
+    je   .nosb
+    call write_sb_save          ; the text being built by the caller survives too
+.nosb:
+    mov  byte [ex_noc], 1
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ')'
+    je   .close
+.arg:
+    call parse_expr             ; the generated code leaves the value in RAX
+    mov  [w_site], eax          ; (AL = its type; w_site is rewritten below)
+    mov  r8, [rbp + 96]
+    mov  rcx, [rbp]
+    movzx edx, byte [r8 + 20]
+    cmp  rcx, rdx
+    jae  .argcount
+    mov  eax, [w_site]
+    cmp  al, [r8 + 22 + rcx]
+    je   .type_ok
+    cmp  byte [r8 + 22 + rcx], 2
+    jne  .mismatch
+    cmp  al, 1                  ; a str can be passed where an lstr is wanted
+    jne  .mismatch
+    call write_str_to_sb
+    mov  eax, 2
+    mov  rcx, [rbp]
+.type_ok:
+    mov  edx, [rbp + 8]
+    mov  [w_site], edx
+    movzx eax, al
+    call write_arg_push         ; EAX = type, ECX = argument number
+    inc  qword [rbp]
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    mov  al, [rsi]
+    cmp  al, ','
+    jne  .chk_close
+    inc  rsi
+    jmp  .arg
+.chk_close:
+    cmp  al, ')'
+    jne  .syntax
+.close:
+    mov  r8, [rbp + 96]
+    movzx edx, byte [r8 + 20]
+    cmp  [rbp], rdx
+    jne  .argcount
+    inc  rsi
+    mov  [w_fn], r8
+    mov  eax, [rbp + 8]
+    mov  [w_site], eax
+    call write_call_emit
+    cmp  qword [rbp + 80], 0
+    je   .nosb2
+    call write_sb_restore
+.nosb2:
+    call write_call_end
+    mov  r8, [rbp + 96]
+    movzx r9d, byte [r8 + 21]   ; the type of the value
+    cmp  r9d, 0xFE
+    jae  .novalue
+.restore:
+    add  rsp, 16                ; counter, site
+    pop  rdx
+    mov  [cmp_imm], rdx
+    pop  rdx
+    mov  [cmp_tmp], dl
+    pop  rdx
+    mov  [cmp_ltype], dl
+    pop  rdx
+    mov  [cond_op], dl
+    pop  rdx
+    mov  [ex_noc], dl
+    pop  rdx
+    mov  [ex_space], dl
+    pop  rdx
+    mov  [ex_plus], dl
+    pop  rdx
+    mov  [ex_pure], dl
+    pop  rdx
+    mov  [ex_sb], dl
+    pop  rdx
+    mov  [ex_cur], dl
+    add  rsp, 16                ; function, allow
+    pop  rbp
+    mov  eax, r9d
+    ret
+.novalue:
+    cmp  qword [rbp + 104], 0   ; allowed as a statement
+    jne  .restore_void
+    cmp  r9d, 0xFF
+    jne  .mismatch
+    cmp  r8, [cur_fn]
+    jne  .mismatch              ; a function that never returns a value
+    mov  bx, ERR_RET_TYPE       ; its own recursive call before its first ret
+    jmp  error
+.restore_void:
+    mov  r9d, 0xFE
+    jmp  .restore
+.argcount:
+    mov  bx, ERR_ARG_COUNT
+    jmp  error
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
 ; ---- expressions: numbers and text --------------------------------------------------
 ;   expr := term { ( '+' | ',' | ', ' ) term }          evaluated from left to right
 ;   term := number | 'text' | variable | s.length | s[#] | list.x.length | list.x[#]
@@ -2233,12 +2809,32 @@ parse_term:
     call is_ident_start
     test eax, eax
     jz   .syntax
+    call try_builtin            ; bin( ... )  num( ... )
+    test eax, eax
+    jz   .not_builtin
+    jmp  parse_builtin
+.not_builtin:
+    call try_call
+    test eax, eax
+    jz   .plain_term
+    xor  eax, eax               ; a call that returns nothing is no value here
+    jmp  parse_call
+.plain_term:
     call parse_value_expr
     mov  [cmp_tmp], al
     call write_expr
     mov  al, [cmp_tmp]
     ret
 .num:
+    mov  dl, [ex_binctx]
+    call bin_prefix
+    test eax, eax
+    jz   .num_plain
+    call parse_bin_lit
+    call write_lit_bin
+    mov  eax, 3
+    ret
+.num_plain:
     call parse_number
     mov  [cmp_imm], rax
     call write_mov_rax_imm
@@ -2261,8 +2857,356 @@ parse_term:
     mov  bx, ERR_INVALID_VAR_SYNTAX
     jmp  error
 
+; ---- bin: bit strings ---------------------------------------------------------------------
+;   var bin x = 0b1010      0x3F (4 bits per digit)      bin(n) (the 64 bits of a num)      num(b) (the lowest 64 bits)
+;   x = a and b    a or b    a xor b      a not and b = nand,  a not or b = nor,  a not xor b = xnor,   not a = every bit flipped
+;   x.length = number of bits      x[#] = bit # (0 = least significant) as a num
+;   == and != compare two bins (the shorter one is padded with zeros on the left); a bin joins text as 0b...
+; A bin is stored as [length in bits][bits packed into bytes, bit 0 = lowest bit of byte 0] and holds up to
+; BIN_BITS bits.  A shorter operand is padded with zeros on the left (like numbers), the result is as long as
+; the longer operand.  Operations are done left to right in the accumulator rt_bacc.
+
+; EAX = 1 when RSI is at  0b  (always) or  0x  (when DL = 1: the text is read as bits)
+bin_prefix:
+    lea  rax, [rsi + 3]
+    cmp  rax, r12
+    ja   .no
+    cmp  byte [rsi], '0'
+    jne  .no
+    mov  al, [rsi + 1]
+    or   al, 0x20
+    cmp  al, 'b'
+    je   .yes
+    cmp  al, 'x'
+    jne  .no
+    test dl, dl
+    jz   .no
+.yes:
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
+; in: AL = character, R9D = bits per digit (1: binary, 4: hex)   out: EAX = digit value or -1
+bin_digit:
+    movzx eax, al
+    cmp  eax, '0'
+    jb   .no
+    cmp  r9d, 1
+    jne  .hex
+    cmp  eax, '1'
+    ja   .no
+    sub  eax, '0'
+    ret
+.hex:
+    cmp  eax, '9'
+    jbe  .dec
+    or   eax, 0x20
+    cmp  eax, 'a'
+    jb   .no
+    cmp  eax, 'f'
+    ja   .no
+    sub  eax, 'a' - 10
+    ret
+.dec:
+    sub  eax, '0'
+    ret
+.no:
+    mov  eax, -1
+    ret
+
+; RSI at 0b... or 0x...   -> bin_bits / bin_buf, RSI past the literal
+parse_bin_lit:
+    lea  rdi, [bin_buf]
+    mov  ecx, (BIN_BYTES + 8) / 8
+    xor  eax, eax
+    rep  stosq
+    mov  al, [rsi + 1]
+    or   al, 0x20
+    mov  r9d, 1
+    cmp  al, 'x'
+    jne  .go
+    mov  r9d, 4
+.go:
+    add  rsi, 2
+    mov  r8, rsi                ; first digit
+    xor  r10d, r10d             ; number of digits
+.cnt:
+    cmp  rsi, r12
+    jae  .counted
+    mov  al, [rsi]
+    call bin_digit
+    cmp  eax, -1
+    je   .counted
+    inc  r10
+    inc  rsi
+    jmp  .cnt
+.counted:
+    test r10, r10
+    jz   .bad
+    cmp  rsi, r12
+    jae  .sized
+    movzx eax, byte [rsi]
+    call ident_char             ; a letter or digit right after the last digit: not a valid literal
+    test eax, eax
+    jnz  .bad
+.sized:
+    mov  rax, r10
+    imul rax, r9
+    cmp  rax, BIN_BITS
+    ja   .big
+    mov  [bin_bits], rax
+    lea  rbx, [bin_buf]
+    xor  r11d, r11d             ; digit number, from the left
+.fill:
+    cmp  r11, r10
+    jae  .done
+    mov  al, [r8 + r11]
+    call bin_digit
+    mov  edx, eax
+    mov  rax, r10
+    dec  rax
+    sub  rax, r11
+    imul rax, r9                ; number of the lowest bit of this digit
+    xor  ecx, ecx
+.bit:
+    cmp  ecx, r9d
+    jae  .nextd
+    bt   edx, ecx
+    jnc  .skip
+    lea  rdi, [rax + rcx]
+    bts  [rbx], rdi
+.skip:
+    inc  ecx
+    jmp  .bit
+.nextd:
+    inc  r11
+    jmp  .fill
+.done:
+    ret
+.bad:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.big:
+    mov  bx, ERR_BIN_TOO_BIG
+    jmp  error
+
+; EAX = 1 (RSI moved past "not") when the text is  not  followed by a space or tab
+at_not:
+    lea  rax, [rsi + 4]
+    cmp  rax, r12
+    jae  .no
+    cmp  word [rsi], 'no'
+    jne  .no
+    cmp  byte [rsi + 2], 't'
+    jne  .no
+    mov  al, [rsi + 3]
+    cmp  al, ' '
+    je   .yes
+    cmp  al, 0x09
+    jne  .no
+.yes:
+    add  rsi, 3
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
+; at  and / or / xor  (optionally with not in front): consumes it.  out: EAX = 0 and, 1 or, 2 xor, +4 when inverted;
+; -1 (nothing consumed) when something else is there
+match_bin_op:
+    push rsi
+    call read_ident
+    xor  r8d, r8d
+    cmp  rcx, 3
+    jne  .word
+    cmp  word [rdi], 'no'
+    jne  .word
+    cmp  byte [rdi + 2], 't'
+    jne  .word
+    mov  r8d, 4
+    call skip_blanks
+    call read_ident
+.word:
+    cmp  rcx, 3
+    jne  .or
+    cmp  word [rdi], 'an'
+    jne  .xor
+    cmp  byte [rdi + 2], 'd'
+    jne  .none
+    xor  eax, eax
+    jmp  .got
+.xor:
+    cmp  word [rdi], 'xo'
+    jne  .none
+    cmp  byte [rdi + 2], 'r'
+    jne  .none
+    mov  eax, 2
+    jmp  .got
+.or:
+    cmp  rcx, 2
+    jne  .none
+    cmp  word [rdi], 'or'
+    jne  .none
+    mov  eax, 1
+.got:
+    or   eax, r8d
+    add  rsp, 8
+    ret
+.none:
+    pop  rsi
+    mov  eax, -1
+    ret
+
+; RSI at a name:  bin(  or  num(   ->  EAX = 1 / 2, name and '(' consumed;  otherwise EAX = 0, nothing consumed
+try_builtin:
+    push rsi
+    call read_ident
+    cmp  rcx, 3
+    jne  .no
+    mov  eax, 1
+    cmp  word [rdi], 'bi'
+    jne  .num
+    cmp  byte [rdi + 2], 'n'
+    je   .paren
+    jmp  .no
+.num:
+    mov  eax, 2
+    cmp  word [rdi], 'nu'
+    jne  .no
+    cmp  byte [rdi + 2], 'm'
+    jne  .no
+.paren:
+    mov  r8d, eax
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .no
+    cmp  byte [rsi], '('
+    jne  .no
+    inc  rsi
+    add  rsp, 8
+    mov  eax, r8d
+    ret
+.no:
+    pop  rsi
+    xor  eax, eax
+    ret
+
+; bin(n) / num(b)  after the '(' .  out: AL = type of the value (3 / 0), code that leaves it in RAX
+parse_builtin:
+    push rax                    ; kind
+    movzx eax, byte [ex_cur]
+    push rax
+    movzx eax, byte [ex_sb]
+    push rax
+    movzx eax, byte [ex_pure]
+    push rax
+    movzx eax, byte [ex_plus]
+    push rax
+    movzx eax, byte [ex_space]
+    push rax
+    movzx eax, byte [ex_noc]
+    push rax
+    movzx eax, byte [ex_binctx]
+    push rax
+    movzx eax, byte [ex_bin]
+    push rax
+    movzx eax, byte [ex_op]
+    push rax
+    mov  byte [ex_noc], 1
+    cmp  qword [rsp + 72], 2
+    jne  .arg
+    mov  byte [ex_hint], 1      ; num( 0xFF ): the hex literal is bits
+.arg:
+    call parse_expr
+    mov  rdx, [rsp + 72]
+    cmp  edx, 2
+    je   .want_bin
+    test al, al                 ; bin( needs a number
+    jnz  .mismatch
+    jmp  .close
+.want_bin:
+    cmp  al, 3
+    jne  .mismatch
+.close:
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ')'
+    jne  .syntax
+    inc  rsi
+    cmp  qword [rsp + 72], 2
+    je   .to_num
+    call write_bin_from_num
+    jmp  .restore
+.to_num:
+    call write_bin_to_num
+.restore:
+    pop  rdx
+    mov  [ex_op], dl
+    pop  rdx
+    mov  [ex_bin], dl
+    pop  rdx
+    mov  [ex_binctx], dl
+    pop  rdx
+    mov  [ex_noc], dl
+    pop  rdx
+    mov  [ex_space], dl
+    pop  rdx
+    mov  [ex_plus], dl
+    pop  rdx
+    mov  [ex_pure], dl
+    pop  rdx
+    mov  [ex_sb], dl
+    pop  rdx
+    mov  [ex_cur], dl
+    pop  rax
+    cmp  eax, 2
+    je   .r_num
+    mov  eax, 3
+    ret
+.r_num:
+    xor  eax, eax
+    ret
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
 ; out: AL = type; code that leaves the value in RAX (see above)
 parse_expr:
+    mov  al, [ex_hint]
+    mov  [ex_binctx], al
+    mov  byte [ex_hint], 0
+    mov  byte [ex_bin], 0
+    call skip_blanks
+    call at_bool                ; bool a < b is the whole value (a num: 1 or 0)
+    test eax, eax
+    jz   .no_bool
+    call parse_bool
+    xor  eax, eax
+    ret
+.no_bool:
+    call at_not                 ; not b   (a bin with every bit flipped)
+    test eax, eax
+    jz   .first
+    mov  byte [ex_binctx], 1
+    call parse_term
+    cmp  al, 3
+    jne  .mismatch
+    call write_bin_load
+    call write_bin_not
+    mov  byte [ex_bin], 1
+    call write_bin_result
+    mov  byte [ex_cur], 3
+    mov  byte [ex_sb], 0
+    mov  byte [ex_pure], 0
+    jmp  .loop
+.first:
     call parse_term
     mov  [ex_cur], al
     mov  byte [ex_sb], 0
@@ -2271,12 +3215,39 @@ parse_expr:
     call skip_blanks
     cmp  rsi, r12
     jae  .done
+    cmp  byte [ex_cur], 3       ; a bin: and / or / xor  (with  not  in front of the word: nand / nor / xnor)
+    jne  .nobin
+    cmp  byte [ex_sb], 0
+    jne  .nobin
+    call match_bin_op
+    cmp  eax, -1
+    je   .nobin
+    mov  [ex_op], al
+    mov  byte [ex_binctx], 1
+    cmp  byte [ex_bin], 0
+    jne  .have_acc
+    call write_bin_load         ; the first term goes into the accumulator
+    mov  byte [ex_bin], 1
+.have_acc:
+    movzx eax, byte [ex_op]
+    push rax
+    call parse_term
+    pop  rdx
+    mov  [ex_op], dl
+    cmp  al, 3
+    jne  .mismatch
+    call write_bin_op
+    call write_bin_result
+    jmp  .loop
+.nobin:
     mov  al, [rsi]
     mov  byte [ex_space], 0
     cmp  al, '+'
     je   .plus
     cmp  al, ','
     jne  .done
+    cmp  byte [ex_noc], 0
+    jne  .done                  ; inside call arguments: the comma separates arguments
     mov  byte [ex_plus], 0
     inc  rsi
     cmp  rsi, r12
@@ -2296,7 +3267,7 @@ parse_expr:
     cmp  byte [ex_sb], 0
     jne  .append
     cmp  byte [ex_cur], 0
-    jne  .start_text
+    jne  .not_num_start
     cmp  byte [ex_plus], 0
     je   .start_num
     call write_mov_rbx_rax      ; number + term
@@ -2305,6 +3276,12 @@ parse_expr:
     jnz  .mismatch
     call write_add_rbx
     jmp  .loop
+.not_num_start:
+    cmp  byte [ex_plus], 0      ; '+' does not join a bin
+    je   .start_text
+    cmp  byte [ex_cur], 3
+    je   .mismatch
+    jmp  .start_text
 .start_num:                     ; number , term  ->  text
     mov  byte [ex_pure], 1
 .start_text:
@@ -2320,6 +3297,8 @@ parse_expr:
     je   .chk_pure
     test al, al
     jz   .mismatch              ; '+' needs text on both sides
+    cmp  al, 3
+    je   .mismatch
 .chk_pure:
     cmp  byte [ex_pure], 0
     je   .do_app
@@ -2342,6 +3321,80 @@ parse_expr:
     mov  bx, ERR_TYPE_MISMATCH
     jmp  error
 
+; EAX = 1 (and RSI moved past the word) when the text at RSI is  bool  followed by a space or tab
+at_bool:
+    lea  rax, [rsi + 5]
+    cmp  rax, r12
+    jae  .no
+    cmp  dword [rsi], 'bool'
+    jne  .no
+    mov  al, [rsi + 4]
+    cmp  al, ' '
+    je   .yes
+    cmp  al, 0x09
+    jne  .no
+.yes:
+    add  rsi, 4
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
+; bool A op B   /   bool A  (a number on its own: true when not 0)      RSI is just past "bool"
+; The generated code leaves 1 or 0 in RAX. Same operands and operators as an if condition.
+parse_bool:
+    mov  byte [cmp_ltype], 0xFF
+    call parse_cmp_operand
+    mov  [cmp_ltype], al
+    call write_mov_rbx_rax
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .truthy
+    mov  al, [rsi]
+    cmp  al, 0x0A
+    je   .truthy
+    cmp  al, 0x0D
+    je   .truthy
+    cmp  al, '#'
+    je   .truthy
+    cmp  byte [ex_noc], 0
+    je   .cmp_op
+    cmp  al, ','
+    je   .truthy
+    cmp  al, ')'
+    je   .truthy
+.cmp_op:
+    call parse_cmp_op
+    call parse_cmp_operand
+    cmp  al, [cmp_ltype]
+    jne  .mismatch
+    cmp  al, 1                  ; strings and bins: only == and !=
+    je   .eqonly
+    cmp  al, 3
+    jne  .emit
+.eqonly:
+    cmp  byte [cond_op], 2
+    ja   .bad_cmp
+    cmp  al, 3
+    jne  .emit
+    call write_bin_eq           ; the comparison is made on 1 / 0
+.emit:
+    jmp  write_setcc
+.truthy:
+    cmp  byte [cmp_ltype], 0
+    jne  .mismatch
+    mov  byte [cond_op], 2
+    mov  qword [cmp_imm], 0
+    call write_mov_rax_imm
+    jmp  write_setcc
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+.bad_cmp:
+    mov  bx, ERR_BAD_COMPARE
+    jmp  error
+
 ; x = expr / x += expr / x -= expr   ([as_name], [as_len], [as_kind]; RSI is just past the operator)
 parse_assign:
     mov  rdi, [as_name]
@@ -2349,9 +3402,16 @@ parse_assign:
     call find_var
     movzx eax, byte [rax + 1]
     and  eax, VAR_TYPE_MASK
+    cmp  eax, 5
+    je   .bin_target
     cmp  eax, 2
     ja   .mismatch              ; lists can't be assigned
+.bin_target:
     mov  [st_type], al
+    cmp  al, 5
+    jne  .nohint
+    mov  byte [ex_hint], 1
+.nohint:
     mov  rax, [as_name]
     mov  [st_name], rax
     mov  rax, [as_len]
@@ -2360,6 +3420,14 @@ parse_assign:
     mov  [ex_type], al
     call expect_end
     movzx eax, byte [ex_type]
+    cmp  byte [st_type], 5
+    jne  .not_bin_var
+    cmp  eax, 3                 ; a bin takes a bin (and only = : no += / -=)
+    jne  .mismatch
+    cmp  byte [as_kind], 0
+    jne  .mismatch
+    jmp  write_assign
+.not_bin_var:
     cmp  byte [st_type], 0
     jne  .text_var
     test eax, eax               ; a num variable takes a number
@@ -2370,6 +3438,8 @@ parse_assign:
     je   .mismatch              ; -= is for numbers
     test eax, eax
     jz   .mismatch              ; str / lstr take text
+    cmp  eax, 3
+    je   .mismatch
     jmp  write_assign
 .mismatch:
     mov  bx, ERR_TYPE_MISMATCH
@@ -2384,6 +3454,7 @@ parse_assign:
 
 ; in: [cb_chain] / [cb_k] = label to jump to when the condition fails; RSI after the keyword
 parse_condition:
+    mov  byte [cmp_ltype], 0xFF
     call parse_cmp_operand      ; AL = type, the value is left in RAX by the generated code
     mov  [cmp_ltype], al
     call write_mov_rbx_rax      ; keep the left value in RBX while the right one is computed
@@ -2403,10 +3474,16 @@ parse_condition:
     call parse_cmp_operand
     cmp  al, [cmp_ltype]
     jne  .mismatch
-    cmp  al, 1                  ; strings: only == and !=
+    cmp  al, 1                  ; strings and bins: only == and !=
+    je   .eqonly
+    cmp  al, 3
     jne  .emit
+.eqonly:
     cmp  byte [cond_op], 2
     ja   .bad_cmp
+    cmp  al, 3
+    jne  .emit
+    call write_bin_eq           ; the comparison is made on 1 / 0
 .emit:
     jmp  write_cmp_jump
 .truthy:                        ; "if x:" is "if x != 0:"
@@ -2445,6 +3522,21 @@ parse_cmp_operand:
     call is_ident_start
     test eax, eax
     jz   .syntax
+    call try_builtin            ; bin( ) / num( ) as an operand
+    test eax, eax
+    jz   .not_bi
+    call parse_builtin
+    ret
+.not_bi:
+    call try_call
+    test eax, eax
+    jz   .plain_opd
+    xor  eax, eax
+    call parse_call
+    cmp  al, 2
+    je   .lstr_cmp
+    ret
+.plain_opd:
     call parse_value_expr       ; variable, s.length, s[#], list.x.length, list.x[#]
     mov  [cmp_tmp], al
     cmp  al, 2
@@ -2456,6 +3548,17 @@ parse_cmp_operand:
     mov  bx, ERR_TYPE_MISMATCH
     jmp  error
 .num:
+    xor  edx, edx
+    cmp  byte [cmp_ltype], 3    ; the right side of a bin comparison: 0x... is bits
+    sete dl
+    call bin_prefix
+    test eax, eax
+    jz   .num_plain
+    call parse_bin_lit
+    call write_lit_bin
+    mov  eax, 3
+    ret
+.num_plain:
     call parse_number
     mov  [cmp_imm], rax
     call write_mov_rax_imm
