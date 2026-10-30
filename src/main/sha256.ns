@@ -20,11 +20,17 @@ class sha256(in):
     until __i = __temp.length:
         __blocks.append(__temp[__i:__i + 511]
         __i += 512
+    # Now we need to break the blocks into words.
     list __words
     tvar int __n
     tvar int __i
     for __b = __blocks.length:
         __words.append(__blocks[__b][__i * 16 + __n]
         __n += 1
-        __i += 16
-    
+        if __n == 16:
+            __n = 0
+            __i += 16
+    for __i = __words.length:
+        tvar int __val = __words.length * 16 + 0x0E00
+        mem.setloc([0x0E00:__val],__words]
+        \p[
