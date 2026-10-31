@@ -3,6 +3,83 @@
 # It is written in Nano for readability.
 # It is required for the Nano compiler to compile any other programs.
 
+var int __tint
+var bool __tbool
+var int __h_0 = 0x
+
+def rotr(in, amt):
+    tvar int __x = in.length
+    tvar int __o
+    if __x << 1:
+        return 0
+    elif __x == 1:
+        return 1
+    else:
+        __o = in[1],in[2:__x]
+    return __o
+
+def shr(in, amt):
+    tvar int __x = in.length
+    tvar int __o
+    if __x << 1:
+        return 0
+    elif __x == 1:
+        return b\2
+    else:
+        __o = 0,in[1:__x-1]
+    return __o
+
+def choose(x, y, z);
+    bool x and y
+    bool2 x and z
+    bool2 not .out2
+    bool .out xor .out2
+    return bool.out
+
+def major(x, y, z):
+    bool x and y
+    bool2 x and z
+    bool .out xor .out2
+    bool2 y and z
+    bool .out xor .out2
+    return bool.out
+
+def uppersig0(x):
+    tbool = rotr(x,2)
+    bool tbool
+    tbool = rotr(x,13)
+    bool .out xor tbool
+    tbool = rotr(x,22)
+    bool .out xor tbool
+    return bool.out
+
+def uppersig1(x):
+    tbool = rotr(x,6)
+    bool tbool
+    tbool = rotr(x,11)
+    bool .out xor tbool
+    tbool = rotr(x,25)
+    bool .out xor tbool
+    return bool.out
+
+def lowersig0(x):
+    tbool = rotr(x,7)
+    bool tbool
+    tbool = rotr(x,18)
+    bool .out xor tbool
+    tbool = shr(x,3)
+    bool .out xor tbool
+    return bool.out
+    
+def lowersig1(x):
+    tbool = rotr(x,19)
+    bool tbool
+    tbool = rotr(x,25)
+    bool .out xor tbool
+    tbool = shr(x,10)
+    bool .out xor tbool
+    return bool.out
+
 class sha256(in):
     var bin __in = in
     __in = __in,1
@@ -24,13 +101,35 @@ class sha256(in):
     list __words
     tvar int __n
     tvar int __i
+    tvar int __t
     for __b = __blocks.length:
-        __words.append(__blocks[__b][__i * 16 + __n]
+        __t = t,__blocks[__b][__i + __n]
         __n += 1
-        if __n == 16:
+        if __n == 32:
             __n = 0
-            __i += 16
-    for __i = __words.length:
-        tvar int __val = __words.length * 16 + 0x0E00
-        mem.setloc([0x0E00:__val],__words]
-        \p[
+            __i += 32
+            __words.append(__t)
+    var int __block
+    list __out_words
+    for __word = __words.length:
+        if __word - {16 * __block} <= 15:
+            __out_words.append(__word)
+        else:
+            __out_words.append(lowersig1(__out_words[__word-2])+{__out_words[__word-7]}+lowersig0(__out_words[__word-15])+__out_words[__word-16])
+        bool not __word == 0
+        bool2 {__word + 1} % 64 == 0
+        if bool.out and bool.out2:
+            __block += 1
+
+
+
+
+
+
+
+
+
+
+
+
+
