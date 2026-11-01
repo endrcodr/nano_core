@@ -30,6 +30,7 @@ FN_LISTDECL equ 15              ; list num|str name
 FN_LISTOP   equ 16              ; list.name.append / insert / remove / clear / sort
 FN_ASSIGN   equ 17              ; x = expr / x += expr / x -= expr / name(args)
 FN_RET      equ 18              ; ret [value]
+FN_CLASS    equ 19              ; class name:
 FN_MAX      equ 64              ; functions per program
 FN_SIZE     equ 160             ; bytes per function record (see "functions" below)
 MAX_PARAMS  equ 8
@@ -62,7 +63,8 @@ EX_LSTR_IDX equ 5               ; l[#]
 EX_LIST_LEN equ 6               ; list.x.length
 EX_LIST_IDX equ 7               ; list.x[#]
 EX_BIN_LEN  equ 8               ; b.length (bits)
-EX_BIN_IDX  equ 9               ; b[#]     (bit number # counted from the least significant end)
+EX_BIN_IDX  equ 9               ; b[#]     (old form)
+EX_DONE     equ 10              ; the code for the value was already written while parsing (b[#], b[a:b])
 
 ; ---- list statements: ls_op ---------------------------------------------------
 LS_APPEND equ 1
@@ -105,7 +107,8 @@ ERR_ARG_COUNT          equ 29   ; wrong number of arguments
 ERR_RET_OUTSIDE        equ 30   ; ret outside a def
 ERR_BIN_TOO_BIG        equ 31   ; bin literal longer than BIN_BITS
 ERR_BIN_LOCAL          equ 32   ; bin variable inside a def
-ERR_COUNT              equ 28   ; number of messages in err_msgs (codes 5..30)
+ERR_CLASS_CALL        equ 33   ; a class is run with call(name), a def with name(args)
+ERR_COUNT              equ 29   ; number of messages in err_msgs (codes 5..30)
 
 VAR_TABLE_SIZE equ 0x10000
 
@@ -133,6 +136,11 @@ section .bss
     vd_type     resb 1              ; 0 num, 1 str, 2 lstr
     vd_temp     resb 1              ; 1 for tvar
     vd_has_init resb 1
+    vd_start    resq 1              ; where the declaration's first word starts (untyped var)
+    num_op      resb 1
+    bc_ty       resb 1
+    pp_type     resb 1
+    sub_ty      resb 1
     vd_init_kind resb 1             ; 0 = literal in vd_value, 1 = expression in expr_*
     resb 4
     vd_value    resq 1              ; num value, or the str packed little-endian
@@ -200,6 +208,7 @@ section .bss
     ex_plus     resb 1              ; the operator being parsed is '+' (otherwise ',')
     ex_space    resb 1              ; ', ' joins with a space
     ex_pure     resb 1              ; a ',' started from a number: the right side has to be text
+    cur_class   resb 1              ; 1 = the def being compiled is a class (its variables are global)
     ex_hint     resb 1              ; 1 = the next parse_expr reads 0x... literals as bits (set by the caller)
     ex_binctx   resb 1              ; ... and while the value so far is a bin
     ex_bin      resb 1              ; 1 = the value so far is in rt_bacc (a bit operation was done)
@@ -253,6 +262,7 @@ kw_table:
     KW "bool",   FN_BOOL
     KW "def",    FN_DEF
     KW "ret",    FN_RET
+    KW "class",  FN_CLASS
     KW "import", FN_IMPORT
     db 0
 ; "mem." and "fs." families are matched by prefix in match_keyword.
@@ -300,6 +310,7 @@ err_msgs:
     MSG "ret outside of a def"                                  ; 30
     MSG "binary literal is longer than 32768 bits"              ; 31
     MSG "bin variables can only be declared outside a def (they can still be used inside one)" ; 32
+    MSG "a class is run with call(name); a def is called as name(args)" ; 33
 
 STR s_msg_err,  "nlang: error 0x"
 STR s_msg_line, " (line "
@@ -346,9 +357,11 @@ section .text
 ; @@@.length - Returns the length of the string @@@.
 ; # - Used to mark a comment. Single hashes mean one line, every character of text after that point. Triple hashes mean a multi-line comment, which continues until the next triple hash.
 ; bool ### % ### - used to compute boolean functions seperately, used when defining a variable's value. The result is stored in the variable, and can be used later in the code.
-; var bin @@@ [= *] - Defines a binary variable: a string of bits (up to 32768) used directly as bits, not as text. Literals are 0b1010 (binary) and 0xF0 (4 bits per hex digit); x.length is the number of bits, x[#] is bit # (0 = least significant) as a num.
+; var bin @@@ [= *] - Defines a binary variable: a string of bits (up to 32768) used directly as bits, not as text. Literals are 0b1010 (binary) and 0xF0 (4 bits per hex digit); x.length is the number of bits, x[p] is the bit at position p counted from the LEFT (0 = first bit) as a num, x[lo:hi] a slice; << >> shift, <<< >>> rotate, add wraps, `,` joins bits, b\n = bin(n).
 ; @ and @ / @ or @ / @ xor @ - Bitwise operations between bins; the shorter bin is padded with zeros on the left. Put 'not' before the operator to invert the result (nand, nor, xnor): a not and b. 'not a' flips every bit. Operations run left to right.
 ; bin(n) / num(b) - Convert a num to a 64-bit bin / the lowest 64 bits of a bin to a num. == and != compare bins. In a text join a bin shows as 0b....
+; class @@@: - Defines a block of code that does not run by itself: it only runs when something calls it with call(@@@). A class takes no arguments and returns no value; the variables declared in it are global.
+; call(@@@) - Runs the class named @@@. Only classes are run this way (functions are called as name(args)).
 ; def @@@ (args): - Defines a function. The name is represented here as '@@@', and arguments, however many are needed, are represented as 'args'. The function is called by using the name of the function, and passing in the arguments. The function can return a value, which can be used in the code.
 ; import @@@ - Imports the compiled code of another file to this location in this file. The name of the file is represented here as '@@@', and the file must be in the same directory as this file, in the defined directory, in the system's PATH, or from locations such as GitHub using its URL, then its file location. This allows projects built on a GitHub repository to be compiled and run without needing to manually download the new files, replace the file in the directory, and recompile the code, as opposed to simply recompiling the code.
 ; mem. functions - Functions that allow the user to manipulate memory, such as copying, moving, and deleting data. These functions are as follows:
@@ -597,6 +610,8 @@ compile:
     je   .for_stmt
     cmp  eax, FN_DEF
     je   .def_stmt
+    cmp  eax, FN_CLASS
+    je   .class_stmt
     cmp  eax, FN_RET
     je   .ret_stmt
     jmp  .func_logic
@@ -751,6 +766,17 @@ compile:
     jmp  error
 
 ; ---- def / ret ----------------------------------------------------------------------
+.class_stmt:
+    cmp  dword [blk_depth], 0
+    jne  .err_def_nested
+    call parse_class_header
+    call expect_colon_end
+    mov  eax, [cur_fn_id]
+    mov  [cb_chain], eax
+    mov  dword [cb_k], 0
+    mov  al, BK_DEF
+    call push_frame
+    jmp  .stmt_done
 .def_stmt:
     cmp  dword [blk_depth], 0
     jne  .err_def_nested
@@ -780,8 +806,6 @@ compile:
     je   .ret_bare
     call parse_expr
     mov  [ex_type], al
-    cmp  al, 3
-    je   .err_wrong_type        ; (functions don't return a bin yet)
     call expect_end
     mov  r8, [cur_fn]
     movzx eax, byte [r8 + 21]
@@ -830,7 +854,16 @@ compile:
     mov  rcx, [as_len]
     call fn_find
     test rax, rax
-    jz   .err_unknown_name      ; name( ... ) and no such function
+    jnz  .fn_there
+    cmp  qword [as_len], 4      ; call( name ): runs a class
+    jne  .err_unknown_name
+    mov  rdi, [as_name]
+    cmp  dword [rdi], 'call'
+    jne  .err_unknown_name
+    jmp  .call_class
+.fn_there:
+    cmp  byte [rax + 30], 0
+    jne  .err_class_call        ; a class can't be called like a function
     mov  [call_fn], rax
     inc  rsi                    ; past '('
     mov  r14d, FN_ASSIGN
@@ -841,6 +874,20 @@ compile:
     call parse_call
     call expect_end
     jmp  .stmt_done
+.call_class:                    ; RSI at '('
+    inc  rsi
+    call parse_call_target
+    mov  r14d, FN_ASSIGN
+    mov  rdi, [as_name]
+    mov  rcx, [as_len]
+    call note_stmt
+    mov  al, 1                  ; the value, if there is one, is dropped
+    call parse_call
+    call expect_end
+    jmp  .stmt_done
+.err_class_call:
+    mov  bx, ERR_CLASS_CALL
+    jmp  error
 .err_wrong_type:
     mov  bx, ERR_TYPE_MISMATCH
     jmp  error
@@ -1097,6 +1144,8 @@ note_stmt:
     cmp  r14d, FN_ASSIGN
     je   .compiled
     cmp  r14d, FN_DEF
+    je   .compiled
+    cmp  r14d, FN_CLASS
     je   .compiled
     cmp  r14d, FN_RET
     je   .compiled
@@ -1539,11 +1588,19 @@ parse_string_lit:
 ; its NASM. Leaves RSI at the end of the statement (newline / '#' / EOF).
 parse_var_decl:
     call skip_blanks
+    mov  [vd_start], rsi
     call read_ident
     test rcx, rcx
     jz   .syntax
     cmp  rcx, 3
     jne  .try_lstr
+    cmp  word [rdi], 'in'       ; int = num
+    jne  .not_int
+    cmp  byte [rdi + 2], 't'
+    jne  .bad_type
+    mov  byte [vd_type], 0
+    jmp  .got_type
+.not_int:
     cmp  word [rdi], 'nu'
     jne  .try_str
     cmp  byte [rdi + 2], 'm'
@@ -1563,7 +1620,10 @@ parse_var_decl:
     cmp  byte [rdi + 2], 'n'
     jne  .bad_type
     cmp  qword [cur_fn], 0
-    jne  .bin_local
+    je   .bin_ok
+    cmp  byte [cur_class], 0
+    je   .bin_local
+.bin_ok:
     mov  byte [vd_type], 5
     jmp  .got_type
 .bin_local:
@@ -1601,6 +1661,8 @@ parse_var_decl:
     call skip_blanks
     mov  byte [vd_has_init], 1
     mov  [ex_start], rsi
+    cmp  byte [vd_type], 0xFE
+    je   .untyped
     cmp  byte [vd_type], 5
     jne  .not_bin
     mov  byte [ex_hint], 1      ; a bin: always an expression (0x... is read as bits)
@@ -1657,6 +1719,14 @@ parse_var_decl:
     je   .rewind
     cmp  dl, ','
     je   .rewind
+    cmp  dl, '-'
+    je   .rewind
+    cmp  dl, '*'
+    je   .rewind
+    cmp  dl, '/'
+    je   .rewind
+    cmp  dl, '%'
+    je   .rewind
 .plain:
     mov  al, [cmp_tmp]
     cmp  al, [vd_type]
@@ -1686,6 +1756,14 @@ parse_var_decl:
     je   .rewind
     cmp  al, ','
     je   .rewind
+    cmp  al, '-'
+    je   .rewind
+    cmp  al, '*'
+    je   .rewind
+    cmp  al, '/'
+    je   .rewind
+    cmp  al, '%'
+    je   .rewind
     jmp  .end_check
 .do_expr:
     call parse_expr             ; code that leaves the value in rax; AL = its type
@@ -1708,6 +1786,23 @@ parse_var_decl:
     jne  .mismatch
 .dx_ok:
     mov  byte [vd_init_kind], 2
+    jmp  .dx_done
+.untyped:                       ; var x = expr : the variable takes the type of the value
+    call parse_expr
+    mov  [ex_type], al
+    cmp  al, 3
+    jne  .u_set
+    mov  al, 5
+    cmp  qword [cur_fn], 0
+    je   .u_set
+    cmp  byte [cur_class], 0
+    jne  .u_set
+    mov  bx, ERR_BIN_LOCAL
+    jmp  error
+.u_set:
+    mov  [vd_type], al
+    mov  byte [vd_init_kind], 2
+.dx_done:
     mov  qword [vd_lit_len], 0  ; an lstr starts empty; the code stores the value
 .end_check:                     ; nothing but a comment may follow
     call skip_blanks
@@ -1727,6 +1822,15 @@ parse_var_decl:
     call add_var
     jmp  write_var              ; tail call
 .bad_type:
+    call skip_blanks            ; a word that is no type, then '=' : var name = expr
+    cmp  rsi, r12
+    jae  .really_bad
+    cmp  byte [rsi], '='
+    jne  .really_bad
+    mov  rsi, [vd_start]
+    mov  byte [vd_type], 0xFE
+    jmp  .got_type
+.really_bad:
     mov  bx, ERR_BAD_VAR_TYPE
     jmp  error
 .mismatch:
@@ -1932,6 +2036,139 @@ parse_index:
     mov  bx, ERR_INVALID_VAR_SYNTAX
     jmp  error
 
+; a number expression (the code leaves it in RAX) parsed in the middle of another expression: the
+; parser state (ex_*) of the outer expression is kept.   out: AL = type
+parse_sub_expr:
+    movzx eax, byte [ex_cur]
+    push rax
+    movzx eax, byte [ex_sb]
+    push rax
+    movzx eax, byte [ex_pure]
+    push rax
+    movzx eax, byte [ex_plus]
+    push rax
+    movzx eax, byte [ex_space]
+    push rax
+    movzx eax, byte [ex_noc]
+    push rax
+    movzx eax, byte [ex_binctx]
+    push rax
+    movzx eax, byte [ex_bin]
+    push rax
+    movzx eax, byte [ex_op]
+    push rax
+    mov  byte [ex_noc], 1
+    mov  byte [ex_hint], 0
+    call parse_expr
+    mov  [sub_ty], al
+    pop  rdx
+    mov  [ex_op], dl
+    pop  rdx
+    mov  [ex_bin], dl
+    pop  rdx
+    mov  [ex_binctx], dl
+    pop  rdx
+    mov  [ex_noc], dl
+    pop  rdx
+    mov  [ex_space], dl
+    pop  rdx
+    mov  [ex_plus], dl
+    pop  rdx
+    mov  [ex_pure], dl
+    pop  rdx
+    mov  [ex_sb], dl
+    pop  rdx
+    mov  [ex_cur], dl
+    movzx eax, byte [sub_ty]
+    ret
+
+; b[pos]  or  b[lo:hi]   ([expr_name] / [expr_len] = the bin variable, RSI at the '[').
+; Positions are counted from the left (0 = the first bit, the most significant); lo:hi includes both ends.
+; Both are number expressions.  out: AL = 0 (a bit) or 3 (a slice); expr_kind = EX_DONE
+parse_bin_sub:
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], '['
+    jne  .syntax
+    inc  rsi
+    push qword [expr_name]
+    push qword [expr_len]
+    call write_sub_begin
+    call parse_sub_expr
+    test al, al
+    jnz  .mismatch
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ':'
+    je   .slice
+    cmp  byte [rsi], ']'
+    jne  .syntax
+    inc  rsi
+    pop  qword [expr_len]
+    pop  qword [expr_name]
+    call write_bin_idx_end
+    mov  byte [expr_kind], EX_DONE
+    xor  eax, eax
+    ret
+.slice:
+    inc  rsi
+    call write_push_rax
+    call parse_sub_expr
+    test al, al
+    jnz  .mismatch
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ']'
+    jne  .syntax
+    inc  rsi
+    pop  qword [expr_len]
+    pop  qword [expr_name]
+    call write_bin_slice_end
+    mov  byte [expr_kind], EX_DONE
+    mov  eax, 3
+    ret
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+
+; EAX = 1 when a lone  0  or  1  is next (after blanks): consumed, and a one-bit constant bin is in RAX
+at_bit_lit:
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .no
+    mov  al, [rsi]
+    cmp  al, '0'
+    je   .ok
+    cmp  al, '1'
+    jne  .no
+.ok:
+    lea  rcx, [rsi + 1]
+    cmp  rcx, r12
+    jae  .yes
+    movzx edx, al
+    movzx eax, byte [rsi + 1]
+    call ident_char
+    mov  ecx, eax
+    mov  eax, edx
+    test ecx, ecx
+    jnz  .no
+.yes:
+    sub  al, '0'
+    mov  [bin_buf], al
+    mov  qword [bin_bits], 1
+    inc  rsi
+    call write_lit_bin
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
 ; A value on the right of 'var x =':
 ;   other_var | s.length | s[#] | list.x.length | list.x[#]
 ; out: AL = type of the value (0 num, 1 str); expr_* (and opd_* for an index) filled
@@ -2027,10 +2264,7 @@ parse_value_expr:
     mov  byte [expr_kind], EX_LSTR_IDX
     jmp  .idx_done
 .is_bin_idx:
-    mov  byte [expr_kind], EX_BIN_IDX
-    call parse_index
-    xor  eax, eax               ; a bit is a number
-    ret
+    jmp  parse_bin_sub          ; b[pos] is a number (0 / 1), b[lo:hi] is a bin; code is written right away
 .is_str_idx:
     mov  byte [expr_kind], EX_STR_IDX
 .idx_done:
@@ -2325,8 +2559,12 @@ finalize_top:
     jmp  .pop
 .def_end:                       ; the function's closing code; its parameters and locals go out of scope
     call write_def_end
+    cmp  byte [cur_class], 0    ; (a class has no locals: its variables stay)
+    jne  .cls_end
     mov  al, [scope_cnt]
     mov  [r15], al
+.cls_end:
+    mov  byte [cur_class], 0
     mov  qword [cur_fn], 0
     mov  dword [cur_fn_id], 0
     mov  qword [scope_lo], 0
@@ -2478,6 +2716,13 @@ fn_find:
 type_word:
     cmp  rcx, 3
     jne  .l4
+    cmp  word [rdi], 'in'       ; int = num
+    jne  .nu
+    cmp  byte [rdi + 2], 't'
+    jne  .bad
+    xor  eax, eax
+    ret
+.nu:
     cmp  word [rdi], 'nu'
     jne  .s
     cmp  byte [rdi + 2], 'm'
@@ -2485,6 +2730,13 @@ type_word:
     xor  eax, eax
     ret
 .s:
+    cmp  word [rdi], 'bi'       ; bin (a parameter or return value of this type is passed as a copy)
+    jne  .s2
+    cmp  byte [rdi + 2], 'n'
+    jne  .bad
+    mov  eax, 3
+    ret
+.s2:
     cmp  word [rdi], 'st'
     jne  .bad
     cmp  byte [rdi + 2], 'r'
@@ -2502,11 +2754,121 @@ type_word:
     mov  bx, ERR_BAD_VAR_TYPE
     jmp  error
 
+; the parameters  ( type a, type b )  of a def or a class.  RSI at the '(' ; consumes up to and including ')'.
+; A parameter with no type word (just a name) is a bin.
+parse_param_list:
+    inc  rsi
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ')'
+    jne  .param
+    inc  rsi
+    ret
+.param:
+    call skip_blanks
+    mov  [vd_start], rsi
+    call read_ident
+    test rcx, rcx
+    jz   .syntax
+    call skip_blanks            ; a lone name (followed by , or ) ) is a bin parameter
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ','
+    je   .lone
+    cmp  byte [rsi], ')'
+    je   .lone
+    call type_word
+    jmp  .have_type
+.lone:                          ; a type word with no name after it is not a parameter name
+    cmp  rcx, 4
+    jne  .l3
+    cmp  dword [rdi], 'lstr'
+    je   .syntax
+    jmp  .untyped
+.l3:
+    cmp  rcx, 3
+    jne  .untyped
+    cmp  word [rdi], 'nu'
+    je   .l3n
+    cmp  word [rdi], 'in'
+    je   .l3t
+    cmp  word [rdi], 'st'
+    je   .l3r
+    cmp  word [rdi], 'bi'
+    jne  .untyped
+    cmp  byte [rdi + 2], 'n'
+    je   .syntax
+    jmp  .untyped
+.l3n:
+    cmp  byte [rdi + 2], 'm'
+    je   .syntax
+    jmp  .untyped
+.l3t:
+    cmp  byte [rdi + 2], 't'
+    je   .syntax
+    jmp  .untyped
+.l3r:
+    cmp  byte [rdi + 2], 'r'
+    je   .syntax
+.untyped:
+    mov  rsi, [vd_start]
+    mov  eax, 3
+.have_type:
+    mov  [pp_type], al
+    mov  [vd_type], al
+    cmp  al, 3
+    jne  .tmap
+    mov  byte [vd_type], 5
+.tmap:
+    call read_new_name
+    mov  byte [vd_temp], 0
+    mov  byte [vd_has_init], 0
+    mov  byte [vd_init_kind], 0
+    mov  qword [vd_value], 0
+    mov  qword [vd_lit_len], 0
+    mov  r8, [cur_fn]
+    movzx ecx, byte [r8 + 20]
+    cmp  ecx, MAX_PARAMS
+    jae  .full
+    mov  al, [pp_type]
+    mov  [r8 + 22 + rcx], al
+    mov  edx, ecx
+    shl  edx, 4
+    mov  rax, [vd_name]
+    mov  [r8 + 32 + rdx], rax
+    mov  rax, [vd_len]
+    mov  [r8 + 40 + rdx], rax
+    inc  byte [r8 + 20]
+    call add_var
+    call write_param_decl
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    mov  al, [rsi]
+    inc  rsi
+    cmp  al, ','
+    je   .param
+    cmp  al, ')'
+    jne  .syntax
+    ret
+.full:
+    mov  bx, ERR_TABLE_FULL
+    jmp  error
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+
 ; def NAME (type a, type b):     RSI is just past "def"
 parse_def_header:
     call read_new_name          ; checks the name against variables (vd_name / vd_len)
     mov  rdi, [vd_name]
     mov  rcx, [vd_len]
+    cmp  rcx, 4                 ; call( ) is how classes are run: no function is called  call
+    jne  .not_call
+    cmp  dword [rdi], 'call'
+    je   .redeclared
+.not_call:
     call fn_find
     test rax, rax
     jnz  .redeclared
@@ -2539,51 +2901,7 @@ parse_def_header:
     jae  .syntax
     cmp  byte [rsi], '('
     jne  .syntax
-    inc  rsi
-    call skip_blanks
-    cmp  rsi, r12
-    jae  .syntax
-    cmp  byte [rsi], ')'
-    jne  .param
-    inc  rsi
-    jmp  .after
-.param:
-    call skip_blanks
-    call read_ident
-    test rcx, rcx
-    jz   .syntax
-    call type_word
-    mov  [vd_type], al
-    call read_new_name
-    mov  byte [vd_temp], 0
-    mov  byte [vd_has_init], 0
-    mov  byte [vd_init_kind], 0
-    mov  qword [vd_value], 0
-    mov  qword [vd_lit_len], 0
-    mov  r8, [cur_fn]
-    movzx ecx, byte [r8 + 20]
-    cmp  ecx, MAX_PARAMS
-    jae  .full
-    mov  al, [vd_type]
-    mov  [r8 + 22 + rcx], al
-    mov  edx, ecx
-    shl  edx, 4
-    mov  rax, [vd_name]
-    mov  [r8 + 32 + rdx], rax
-    mov  rax, [vd_len]
-    mov  [r8 + 40 + rdx], rax
-    inc  byte [r8 + 20]
-    call add_var
-    call write_param_decl
-    call skip_blanks
-    cmp  rsi, r12
-    jae  .syntax
-    mov  al, [rsi]
-    inc  rsi
-    cmp  al, ','
-    je   .param
-    cmp  al, ')'
-    jne  .syntax
+    call parse_param_list
 .after:                         ; optional return type:  def f (num n) num:
     call skip_blanks
     cmp  rsi, r12
@@ -2608,6 +2926,93 @@ parse_def_header:
     mov  bx, ERR_INVALID_VAR_SYNTAX
     jmp  error
 
+; class NAME:   or   class NAME (a, b):   a block of code that only runs when it is called with  call(NAME)  or
+; call(NAME, x, y).  Declared like a def, but its variables - the parameters too - are global: they stay after the class
+; and keep their names (so two classes need different parameter names), a recursive call with arguments overwrites them.
+; A parameter with no type word is a bin.  `ret value` gives a value back: call(NAME, x) can be used in an expression.
+; The code of its body is skipped where the class is written.
+parse_class_header:
+    call read_new_name
+    mov  rdi, [vd_name]
+    mov  rcx, [vd_len]
+    cmp  rcx, 4
+    jne  .not_call
+    cmp  dword [rdi], 'call'
+    je   .redeclared
+.not_call:
+    call fn_find
+    test rax, rax
+    jnz  .redeclared
+    mov  eax, [fn_count]
+    cmp  eax, FN_MAX
+    jae  .full
+    imul eax, eax, FN_SIZE
+    lea  r8, [fn_table]
+    add  r8, rax
+    mov  rax, [vd_name]
+    mov  [r8], rax
+    mov  rax, [vd_len]
+    mov  [r8 + 8], rax
+    inc  dword [fn_count]
+    inc  dword [fn_ids]
+    mov  eax, [fn_ids]
+    mov  [r8 + 16], eax
+    mov  byte [r8 + 20], 0
+    mov  byte [r8 + 21], 0xFF   ; the first ret decides what it gives back (nothing when there is none)
+    mov  byte [r8 + 30], 1      ; a class
+    mov  [cur_fn], r8
+    mov  [cur_fn_id], eax
+    mov  qword [scope_lo], 0
+    mov  byte [cur_class], 1
+    call write_def_begin
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .enter
+    cmp  byte [rsi], '('
+    jne  .enter
+    call parse_param_list       ; class name (a, b):  the parameters are global variables
+.enter:
+    jmp  write_def_enter
+.redeclared:
+    mov  bx, ERR_REDECLARED
+    jmp  error
+.full:
+    mov  bx, ERR_TABLE_FULL
+    jmp  error
+
+; call( NAME, args ):  RSI is just past the '(' .  Reads the class name and the comma after it: [call_fn] = the class and
+; RSI is where parse_call expects the arguments (or the ')').
+parse_call_target:
+    call skip_blanks
+    call read_ident
+    test rcx, rcx
+    jz   .syntax
+    call fn_find
+    test rax, rax
+    jz   .unknown
+    cmp  byte [rax + 30], 0
+    je   .class_err
+    mov  [call_fn], rax
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], ')'
+    je   .ret
+    cmp  byte [rsi], ','
+    jne  .syntax
+    inc  rsi
+.ret:
+    ret
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.unknown:
+    mov  bx, ERR_UNKNOWN_VAR
+    jmp  error
+.class_err:
+    mov  bx, ERR_CLASS_CALL
+    jmp  error
+
 ; RSI is at a name. When it is a function followed by '(' : consume both, [call_fn] = the record, EAX = 1.
 ; Otherwise nothing is consumed and EAX = 0.
 try_call:
@@ -2615,6 +3020,21 @@ try_call:
     call read_ident
     test rcx, rcx
     jz   .no
+    cmp  rcx, 4                 ; call( NAME, args ): runs a class and gives its value
+    jne  .not_call
+    cmp  dword [rdi], 'call'
+    jne  .not_call
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .no
+    cmp  byte [rsi], '('
+    jne  .no
+    inc  rsi
+    call parse_call_target
+    add  rsp, 8
+    mov  eax, 1
+    ret
+.not_call:
     call fn_find
     test rax, rax
     jz   .no
@@ -2624,10 +3044,16 @@ try_call:
     jae  .no
     cmp  byte [rsi], '('
     jne  .no
+    mov  r8, [call_fn]
+    cmp  byte [r8 + 30], 0
+    jne  .is_class
     inc  rsi
     add  rsp, 8
     mov  eax, 1
     ret
+.is_class:
+    mov  bx, ERR_CLASS_CALL
+    jmp  error
 .no:
     pop  rsi
     xor  eax, eax
@@ -2657,7 +3083,16 @@ parse_call:
     movzx eax, byte [cmp_ltype]
     push rax                    ; +32
     movzx eax, byte [cmp_tmp]
-    push rax                    ; +24
+    movzx edx, byte [ex_binctx]
+    shl  edx, 8
+    or   eax, edx
+    movzx edx, byte [ex_bin]
+    shl  edx, 16
+    or   eax, edx
+    movzx edx, byte [ex_op]
+    shl  edx, 24
+    or   eax, edx
+    push rax                    ; +24  (cmp_tmp, ex_binctx, ex_bin, ex_op)
     push qword [cmp_imm]        ; +16
     inc  dword [call_ctr]
     mov  eax, [call_ctr]
@@ -2680,6 +3115,15 @@ parse_call:
     cmp  byte [rsi], ')'
     je   .close
 .arg:
+    mov  r8, [rbp + 96]         ; a bin parameter: 0x... in the argument is read as bits
+    mov  rcx, [rbp]
+    movzx edx, byte [r8 + 20]
+    cmp  rcx, rdx
+    jae  .nohint
+    cmp  byte [r8 + 22 + rcx], 3
+    jne  .nohint
+    mov  byte [ex_hint], 1
+.nohint:
     call parse_expr             ; the generated code leaves the value in RAX
     mov  [w_site], eax          ; (AL = its type; w_site is rewritten below)
     mov  r8, [rbp + 96]
@@ -2739,6 +3183,12 @@ parse_call:
     mov  [cmp_imm], rdx
     pop  rdx
     mov  [cmp_tmp], dl
+    shr  edx, 8
+    mov  [ex_binctx], dl
+    shr  edx, 8
+    mov  [ex_bin], dl
+    shr  edx, 8
+    mov  [ex_op], dl
     pop  rdx
     mov  [cmp_ltype], dl
     pop  rdx
@@ -2783,7 +3233,10 @@ parse_call:
 
 ; ---- expressions: numbers and text --------------------------------------------------
 ;   expr := term { ( '+' | ',' | ', ' ) term }          evaluated from left to right
-;   term := number | 'text' | variable | s.length | s[#] | list.x.length | list.x[#]
+;   term := atom { ( '*' | '/' | '%' ) atom }     a number: * / % bind tighter than + and -  (/ goes through the FPU, cut toward zero;
+;                                                  % is the remainder; dividing by 0 ends the program with 0x206)
+;   atom := number | 'text' | variable | s.length | s[#] | list.x.length | list.x[#] | b[p] | b[lo:hi] | f(args) | call(class, args)
+;   var x = expr  (no type word) takes the type of the value; int is another word for num
 ;   +   two numbers: their sum.  Two texts (str / lstr): joined.
 ;   ,   joins two texts, or a text and a number (the number becomes its decimal digits), with nothing between
 ;   ,_  the same with a space between: a comma that is followed by a space or tab
@@ -2791,7 +3244,90 @@ parse_call:
 ; Types: 0 num, 1 str (rax = up to 8 characters), 2 lstr (rax = address of [length][bytes]).
 
 ; out: AL = type of the term; the generated code leaves its value in RAX
+; term: atoms joined by  *  /  %  (numbers only; they bind tighter than + and -)
+;   a / b  is done in the FPU (x87) and cut toward zero;  a % b  is the remainder (it takes the sign of a)
 parse_term:
+    call parse_atom
+.loop:
+    cmp  al, 3
+    je   .bin
+    test al, al
+    jnz  .out
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .num_out
+    mov  al, [rsi]
+    cmp  al, '*'
+    je   .op
+    cmp  al, '/'
+    je   .op
+    cmp  al, '%'
+    je   .op
+.num_out:
+    xor  eax, eax
+.out:
+    ret
+.op:
+    movzx eax, al
+    inc  rsi
+    push rax
+    call write_push_rax
+    call parse_atom
+    pop  rcx
+    test al, al
+    jnz  .mismatch
+    mov  al, cl
+    call write_num_op
+    xor  eax, eax
+    jmp  .loop
+.bin:                           ; bin << n   >> n   <<< n (rotate left)   >>> n (rotate right)
+    call skip_blanks
+    lea  rax, [rsi + 3]
+    cmp  rax, r12
+    ja   .bin_out
+    mov  al, [rsi]
+    cmp  al, '<'
+    je   .chk
+    cmp  al, '>'
+    jne  .bin_out
+.chk:
+    cmp  [rsi + 1], al
+    jne  .bin_out
+    xor  edx, edx
+    cmp  al, '>'
+    jne  .k1
+    mov  edx, 1
+.k1:
+    cmp  [rsi + 2], al
+    jne  .two
+    add  edx, 2
+    add  rsi, 3
+    jmp  .go
+.two:
+    add  rsi, 2
+.go:
+    push rdx
+    call write_push_rax
+    movzx eax, byte [ex_binctx]
+    push rax
+    mov  byte [ex_binctx], 0
+    call parse_atom             ; the amount: a number
+    pop  rcx
+    mov  [ex_binctx], cl
+    test al, al
+    jnz  .mismatch
+    pop  rax
+    call write_shift_end
+    mov  eax, 3
+    jmp  .loop
+.bin_out:
+    mov  eax, 3
+    ret
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
+
+parse_atom:
     call skip_blanks
     cmp  rsi, r12
     jae  .syntax
@@ -2809,6 +3345,21 @@ parse_term:
     call is_ident_start
     test eax, eax
     jz   .syntax
+    cmp  byte [rsi], 'b'        ; b\n  =  bin(n)
+    jne  .not_bs
+    lea  rcx, [rsi + 2]
+    cmp  rcx, r12
+    jae  .not_bs
+    cmp  byte [rsi + 1], '\'
+    jne  .not_bs
+    add  rsi, 2
+    call parse_atom
+    test al, al
+    jnz  .mismatch
+    call write_bin_from_num
+    mov  eax, 3
+    ret
+.not_bs:
     call try_builtin            ; bin( ... )  num( ... )
     test eax, eax
     jz   .not_builtin
@@ -2856,11 +3407,21 @@ parse_term:
 .syntax:
     mov  bx, ERR_INVALID_VAR_SYNTAX
     jmp  error
+.mismatch:
+    mov  bx, ERR_TYPE_MISMATCH
+    jmp  error
 
 ; ---- bin: bit strings ---------------------------------------------------------------------
 ;   var bin x = 0b1010      0x3F (4 bits per digit)      bin(n) (the 64 bits of a num)      num(b) (the lowest 64 bits)
 ;   x = a and b    a or b    a xor b      a not and b = nand,  a not or b = nor,  a not xor b = xnor,   not a = every bit flipped
-;   x.length = number of bits      x[#] = bit # (0 = least significant) as a num
+;   x.length = number of bits
+;   x[p] = the bit at position p COUNTED FROM THE LEFT (0 = the first / most significant bit) as a num
+;   x[lo:hi] = a slice (a bin), positions from the left, both ends included.  p, lo, hi are number expressions.
+;   x << n  >> n  (shifts, zeros come in; the length stays)    x <<< n  >>> n  (rotates)      n is a number or a variable
+;   a add b = addition that wraps at the longer length (also  not add)     a , b = the bits of a followed by the bits of b
+;   a , 0   a , 1  add one bit;  b\n = bin(n) (64 bits).   Inside call arguments a ',' separates the arguments: join first.
+;   Shifts bind tighter than and / or / xor / add; everything else runs left to right.  Slices, shifts and ',' use
+;   rt_btmp / rt_bacc: do not put a call or a nested bin chain in the middle of a chain.
 ;   == and != compare two bins (the shorter one is padded with zeros on the left); a bin joins text as 0b...
 ; A bin is stored as [length in bits][bits packed into bytes, bit 0 = lowest bit of byte 0] and holds up to
 ; BIN_BITS bits.  A shorter operand is padded with zeros on the left (like numbers), the result is as long as
@@ -3039,6 +3600,13 @@ match_bin_op:
     xor  eax, eax
     jmp  .got
 .xor:
+    cmp  word [rdi], 'ad'       ; add (wraps at the length of the longer operand)
+    jne  .xor2
+    cmp  byte [rdi + 2], 'd'
+    jne  .none
+    mov  eax, 3
+    jmp  .got
+.xor2:
     cmp  word [rdi], 'xo'
     jne  .none
     cmp  byte [rdi + 2], 'r'
@@ -3242,6 +3810,21 @@ parse_expr:
 .nobin:
     mov  al, [rsi]
     mov  byte [ex_space], 0
+    cmp  al, '-'
+    jne  .not_minus
+    cmp  byte [ex_sb], 0        ; number - term
+    jne  .done
+    cmp  byte [ex_cur], 0
+    jne  .done
+    inc  rsi
+    call write_push_rax
+    call parse_term
+    test al, al
+    jnz  .mismatch
+    mov  al, '-'
+    call write_num_op
+    jmp  .loop
+.not_minus:
     cmp  al, '+'
     je   .plus
     cmp  al, ','
@@ -3266,15 +3849,21 @@ parse_expr:
 .op:
     cmp  byte [ex_sb], 0
     jne  .append
+    cmp  byte [ex_cur], 3
+    jne  .op_nb
+    cmp  byte [ex_plus], 0
+    je   .bin_comma             ; bin , bin  joins the bits (bin , text  is still a text join)
+.op_nb:
     cmp  byte [ex_cur], 0
     jne  .not_num_start
     cmp  byte [ex_plus], 0
     je   .start_num
-    call write_mov_rbx_rax      ; number + term
+    call write_push_rax         ; number + term
     call parse_term
     test al, al
     jnz  .mismatch
-    call write_add_rbx
+    mov  al, '+'
+    call write_num_op
     jmp  .loop
 .not_num_start:
     cmp  byte [ex_plus], 0      ; '+' does not join a bin
@@ -3307,6 +3896,30 @@ parse_expr:
     jz   .mismatch              ; two numbers can't be joined with ','
 .do_app:
     call write_sb_append        ; AL = type of the term
+    jmp  .loop
+.bin_comma:
+    call write_push_rax         ; the left bin waits on the stack
+    mov  byte [ex_binctx], 1
+    call at_bit_lit             ; a lone 0 or 1 is a single bit
+    test eax, eax
+    jnz  .bc_cat
+    call parse_term
+    cmp  al, 3
+    je   .bc_cat
+    mov  [bc_ty], al            ; not a bin: a text join after all
+    call write_pop_swap
+    call write_sb_start
+    mov  byte [ex_sb], 1
+    cmp  byte [ex_space], 0
+    je   .bc_ns
+    call write_sb_space
+.bc_ns:
+    call write_mov_rax_rbx
+    mov  al, [bc_ty]
+    jmp  .do_app
+.bc_cat:
+    call write_bin_cat
+    mov  byte [ex_bin], 1
     jmp  .loop
 .done:
     cmp  byte [ex_sb], 0

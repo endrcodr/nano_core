@@ -34,6 +34,7 @@ RT_FRAMES      equ 0x800      ; save area: frame save / restore for recursive ca
 RT_BIN         equ 0x2000     ; bit strings: set / operations / compare / convert
 RT_SBBIN       equ 0x4000     ; ... and bin -> text in the builder
 RT_SBSAVE      equ 0x1000     ; keep the text builder across a call
+RT_DIV         equ 0x8000     ; a / b (FPU) and a % b, with the divide-by-zero check
 
 section .bss
     out_buf    resb OUT_SIZE
@@ -46,6 +47,7 @@ section .bss
     resd 1
     lbl_ptr    resq 1
     lbl_len    resq 1
+    w_aty      resb 1
 
 section .data
 ; (STR is defined in nlang_compiler.nasm, which includes this file)
@@ -207,7 +209,18 @@ STR s_ca_decl,   `:  resb 8 + LSTR_CAP\n`
 STR s_b_nl2x,    `_b\n`
 STR s_b_lbl2,    `_b:\n`
 
-STR s_rt_bin, `\nsection .bss\nrt_bacc:   resb 8 + BIN_BYTES           ; accumulator for bit operations: [length in bits][bits]\nrt_bt:     resb 16\nsection .text\n\nrt_bin_set:                     ; rcx = &destination, rdx = &source: destination := source\n    mov  r8, [rdx]\n    mov  [rcx], r8\n    add  r8, 7\n    shr  r8, 3                  ; bytes\n    add  rcx, 8\n    add  rdx, 8\n    xor  eax, eax\n.l: cmp  rax, r8\n    jae  .d\n    mov  r9b, [rdx + rax]\n    mov  [rcx + rax], r9b\n    inc  rax\n    jmp  .l\n.d: ret\n\nrt_bin_op:                      ; rcx = &accumulator, rdx = &operand, r8d: 0 and, 1 or, 2 xor, +4 = invert the result\n    push rbx\n    push rsi\n    push rdi\n    mov  rsi, [rcx]             ; length of the accumulator\n    mov  rdi, [rdx]             ; length of the operand\n    mov  rbx, rsi\n    cmp  rdi, rbx\n    jbe  .1\n    mov  rbx, rdi               ; the result is as long as the longer one\n.1: mov  r9, rsi\n    add  r9, 7\n    shr  r9, 3                  ; bytes of the accumulator\n    mov  r10, rdi\n    add  r10, 7\n    shr  r10, 3                 ; bytes of the operand\n    mov  rsi, rbx               ; rsi = length of the result\n    add  rbx, 7\n    shr  rbx, 3\n    mov  r11, rbx               ; r11 = bytes of the result\n    xor  edi, edi               ; byte number\n.l: cmp  rdi, r11\n    jae  .fin\n    xor  eax, eax\n    cmp  rdi, r9\n    jae  .nb\n    movzx eax, byte [rcx + rdi + 8]\n.nb:\n    xor  ebx, ebx\n    cmp  rdi, r10\n    jae  .ab\n    movzx ebx, byte [rdx + rdi + 8]\n.ab:\n    test r8b, 2\n    jnz  .xor\n    test r8b, 1\n    jnz  .or\n    and  eax, ebx\n    jmp  .inv\n.or:\n    or   eax, ebx\n    jmp  .inv\n.xor:\n    xor  eax, ebx\n.inv:\n    test r8b, 4\n    jz   .st\n    not  eax\n.st:\n    mov  [rcx + rdi + 8], al\n    inc  rdi\n    jmp  .l\n.fin:\n    mov  [rcx], rsi\n    mov  rdi, rcx\n    mov  ecx, esi\n    and  ecx, 7\n    jz   .done\n    mov  ebx, 1                 ; clear the unused bits of the last byte\n    shl  ebx, cl\n    dec  ebx\n    and  [rdi + r11 + 7], bl\n.done:\n    pop  rdi\n    pop  rsi\n    pop  rbx\n    ret\n\nrt_bin_not:                     ; rcx = &bin: every bit flipped\n    mov  rdx, [rcx]\n    lea  r8, [rdx + 7]\n    shr  r8, 3\n    xor  eax, eax\n.l: cmp  rax, r8\n    jae  .m\n    not  byte [rcx + rax + 8]\n    inc  rax\n    jmp  .l\n.m: mov  r9, rcx\n    mov  ecx, edx\n    and  ecx, 7\n    jz   .d\n    mov  edx, 1\n    shl  edx, cl\n    dec  edx\n    and  [r9 + r8 + 7], dl\n.d: ret\n\nrt_bin_eq:                      ; rcx = &a, rdx = &b -> eax = 1 when they are equal (zero-padded on the left)\n    push rbx\n    mov  r8, [rcx]\n    add  r8, 7\n    shr  r8, 3\n    mov  r9, [rdx]\n    add  r9, 7\n    shr  r9, 3\n    mov  r10, r8\n    cmp  r9, r10\n    jbe  .1\n    mov  r10, r9\n.1: xor  r11d, r11d\n.l: cmp  r11, r10\n    jae  .yes\n    xor  eax, eax\n    cmp  r11, r8\n    jae  .a0\n    movzx eax, byte [rcx + r11 + 8]\n.a0:\n    xor  ebx, ebx\n    cmp  r11, r9\n    jae  .b0\n    movzx ebx, byte [rdx + r11 + 8]\n.b0:\n    cmp  eax, ebx\n    jne  .no\n    inc  r11\n    jmp  .l\n.yes:\n    mov  eax, 1\n    pop  rbx\n    ret\n.no:\n    xor  eax, eax\n    pop  rbx\n    ret\n\nrt_bin_idx:                     ; rcx = &bin, rdx = bit number -> eax = 0 / 1\n    cmp  rdx, [rcx]\n    jae  rt_err_range\n    mov  r8, rcx\n    mov  rax, rdx\n    shr  rax, 3\n    movzx eax, byte [r8 + rax + 8]\n    mov  ecx, edx\n    and  ecx, 7\n    shr  eax, cl\n    and  eax, 1\n    ret\n\nrt_bin_from_num:                ; rax = number -> rax = &bin of its 64 bits\n    lea  rcx, [rt_bt]\n    mov  qword [rcx], 64\n    mov  [rcx + 8], rax\n    mov  rax, rcx\n    ret\n\nrt_bin_to_num:                  ; rax = &bin -> rax = its lowest 64 bits\n    mov  rcx, [rax]\n    add  rcx, 7\n    shr  rcx, 3\n    cmp  rcx, 8\n    jbe  .1\n    mov  ecx, 8\n.1: xor  edx, edx\n.l: test rcx, rcx\n    jz   .d\n    dec  rcx\n    shl  rdx, 8\n    movzx r8d, byte [rax + rcx + 8]\n    or   rdx, r8\n    jmp  .l\n.d: mov  rax, rdx\n    ret\n\n`
+STR s_mov_r8_rax, `    mov  r8, rax\n`
+STR s_call_bin_slice, `    call rt_bin_slice\n`
+STR s_shift_a,   `    mov  rdx, rax\n    pop  rcx\n    mov  r8d, `
+STR s_shift_b,   `\n    call rt_bin_shift\n`
+STR s_bin_cat,   `    mov  rdx, rax\n    pop  rcx\n    call rt_bin_cat\n    lea  rax, [rt_bacc]\n`
+STR s_pop_swap,  `    mov  rbx, rax\n    pop  rax\n`
+STR s_sub_rax_rbx, `    sub  rax, rbx\n`
+STR s_imul_rax_rbx, `    imul rax, rbx\n`
+STR s_call_div,  `    call rt_div\n`
+STR s_call_mod,  `    call rt_mod\n`
+STR s_rt_div, `\nsection .bss\nrt_dq:     resq 3                      ; scratch for the FPU division\nsection .text\nrt_err_div:\n    mov  ecx, 0x206             ; divide by zero\n    jmp  rt_die\n\nrt_div:                         ; rax = rax / rbx, done in the FPU and cut toward zero\n    test rbx, rbx\n    jz   rt_err_div\n    mov  [rt_dq], rax\n    mov  [rt_dq + 8], rbx\n    fnstcw [rt_dq + 16]\n    movzx eax, word [rt_dq + 16]\n    or   ax, 0x0C00             ; round toward zero\n    mov  [rt_dq + 18], ax\n    fldcw [rt_dq + 18]\n    fild qword [rt_dq + 8]\n    fild qword [rt_dq]\n    fdiv st0, st1\n    fistp qword [rt_dq]\n    fstp st0\n    fldcw [rt_dq + 16]\n    mov  rax, [rt_dq]\n    ret\n\nrt_mod:                         ; rax = rax % rbx (the remainder, with the sign of rax)\n    test rbx, rbx\n    jz   rt_err_div\n    cmp  rbx, -1\n    je   .z\n    cqo\n    idiv rbx\n    mov  rax, rdx\n    ret\n.z: xor  eax, eax\n    ret\n`
+STR s_rt_bin, `\nsection .bss\nrt_bacc:   resb 8 + BIN_BYTES           ; accumulator for bit operations: [length in bits][bits]\nrt_bt:     resb 16\nrt_btmp:   resb 8 + BIN_BYTES           ; result of a slice / shift\nrt_bscr:   resb 8 + BIN_BYTES           ; scratch\nsection .text\n\nrt_err_bin:\n    mov  ecx, 0x207             ; a bin would get longer than BIN_BYTES * 8 bits\n    jmp  rt_die\n\nrt_bin_set:                     ; rcx = &destination, rdx = &source: destination := source\n    mov  r8, [rdx]\n    mov  [rcx], r8\n    add  r8, 7\n    shr  r8, 3                  ; bytes\n    add  rcx, 8\n    add  rdx, 8\n    xor  eax, eax\n.l: cmp  rax, r8\n    jae  .d\n    mov  r9b, [rdx + rax]\n    mov  [rcx + rax], r9b\n    inc  rax\n    jmp  .l\n.d: ret\n\nrt_bin_op:                      ; rcx = &accumulator, rdx = &operand, r8d: 0 and, 1 or, 2 xor, 3 add (wraps), +4 = invert the result\n    push rbx\n    push rsi\n    push rdi\n    mov  rsi, [rcx]             ; length of the accumulator\n    mov  rdi, [rdx]             ; length of the operand\n    mov  rbx, rsi\n    cmp  rdi, rbx\n    jbe  .1\n    mov  rbx, rdi               ; the result is as long as the longer one\n.1: mov  r9, rsi\n    add  r9, 7\n    shr  r9, 3                  ; bytes of the accumulator\n    mov  r10, rdi\n    add  r10, 7\n    shr  r10, 3                 ; bytes of the operand\n    mov  rsi, rbx               ; rsi = length of the result\n    add  rbx, 7\n    shr  rbx, 3\n    mov  r11, rbx               ; r11 = bytes of the result\n    xor  edi, edi               ; byte number\n    and  r8d, 7                 ; (bit 8 of r8d is the carry of add)\n.l: cmp  rdi, r11\n    jae  .fin\n    xor  eax, eax\n    cmp  rdi, r9\n    jae  .nb\n    movzx eax, byte [rcx + rdi + 8]\n.nb:\n    xor  ebx, ebx\n    cmp  rdi, r10\n    jae  .ab\n    movzx ebx, byte [rdx + rdi + 8]\n.ab:\n    test r8b, 2\n    jz   .lo\n    test r8b, 1\n    jnz  .add\n    xor  eax, ebx\n    jmp  .inv\n.lo:\n    test r8b, 1\n    jnz  .or\n    and  eax, ebx\n    jmp  .inv\n.or:\n    or   eax, ebx\n    jmp  .inv\n.add:\n    add  eax, ebx\n    test r8d, 0x100\n    jz   .nc\n    inc  eax\n.nc:\n    and  r8d, 0xFFFFFEFF\n    cmp  eax, 255\n    jbe  .inv\n    or   r8d, 0x100\n.inv:\n    test r8b, 4\n    jz   .st\n    not  eax\n.st:\n    mov  [rcx + rdi + 8], al\n    inc  rdi\n    jmp  .l\n.fin:\n    mov  [rcx], rsi\n    mov  rdi, rcx\n    mov  ecx, esi\n    and  ecx, 7\n    jz   .done\n    mov  ebx, 1                 ; clear the unused bits of the last byte\n    shl  ebx, cl\n    dec  ebx\n    and  [rdi + r11 + 7], bl\n.done:\n    pop  rdi\n    pop  rsi\n    pop  rbx\n    ret\n\nrt_bin_not:                     ; rcx = &bin: every bit flipped\n    mov  rdx, [rcx]\n    lea  r8, [rdx + 7]\n    shr  r8, 3\n    xor  eax, eax\n.l: cmp  rax, r8\n    jae  .m\n    not  byte [rcx + rax + 8]\n    inc  rax\n    jmp  .l\n.m: mov  r9, rcx\n    mov  ecx, edx\n    and  ecx, 7\n    jz   .d\n    mov  edx, 1\n    shl  edx, cl\n    dec  edx\n    and  [r9 + r8 + 7], dl\n.d: ret\n\nrt_bin_eq:                      ; rcx = &a, rdx = &b -> eax = 1 when they are equal (zero-padded on the left)\n    push rbx\n    mov  r8, [rcx]\n    add  r8, 7\n    shr  r8, 3\n    mov  r9, [rdx]\n    add  r9, 7\n    shr  r9, 3\n    mov  r10, r8\n    cmp  r9, r10\n    jbe  .1\n    mov  r10, r9\n.1: xor  r11d, r11d\n.l: cmp  r11, r10\n    jae  .yes\n    xor  eax, eax\n    cmp  r11, r8\n    jae  .a0\n    movzx eax, byte [rcx + r11 + 8]\n.a0:\n    xor  ebx, ebx\n    cmp  r11, r9\n    jae  .b0\n    movzx ebx, byte [rdx + r11 + 8]\n.b0:\n    cmp  eax, ebx\n    jne  .no\n    inc  r11\n    jmp  .l\n.yes:\n    mov  eax, 1\n    pop  rbx\n    ret\n.no:\n    xor  eax, eax\n    pop  rbx\n    ret\n\nrt_bin_idx:                     ; rcx = &bin, rdx = position counted from the left (0 = first bit) -> eax = 0 / 1\n    mov  r9, [rcx]\n    cmp  rdx, r9\n    jae  rt_err_range\n    mov  rax, r9\n    dec  rax\n    sub  rax, rdx               ; number of the bit counted from the right\n    mov  r8, rcx\n    mov  rdx, rax\n    shr  rdx, 3\n    movzx edx, byte [r8 + rdx + 8]\n    mov  ecx, eax\n    and  ecx, 7\n    shr  edx, cl\n    and  edx, 1\n    mov  eax, edx\n    ret\n\nrt_bin_slice:                   ; rcx = &bin, rdx = lo, r8 = hi (positions from the left, both included) -> rax = &rt_btmp\n    push rbx\n    push rsi\n    mov  rsi, rcx\n    mov  r9, [rsi]\n    cmp  rdx, r8\n    ja   rt_err_range\n    cmp  r8, r9\n    jae  rt_err_range\n    mov  rbx, r9\n    dec  rbx\n    sub  rbx, r8                ; rbx = number of the first source bit (from the right)\n    sub  r8, rdx\n    inc  r8                     ; r8 = bits in the slice\n    lea  r10, [rt_btmp]\n    mov  [r10], r8\n    lea  r11, [r8 + 7]\n    shr  r11, 3\n    xor  eax, eax\n.z: cmp  rax, r11\n    jae  .zd\n    mov  byte [r10 + rax + 8], 0\n    inc  rax\n    jmp  .z\n.zd:\n    xor  edx, edx               ; bit of the result\n.l: cmp  rdx, r8\n    jae  .d\n    lea  rax, [rbx + rdx]\n    mov  r9, rax\n    shr  r9, 3\n    movzx r9d, byte [rsi + r9 + 8]\n    mov  ecx, eax\n    and  ecx, 7\n    shr  r9d, cl\n    and  r9d, 1\n    jz   .n\n    mov  rax, rdx\n    shr  rax, 3\n    mov  ecx, edx\n    and  ecx, 7\n    mov  r9d, 1\n    shl  r9d, cl\n    or   [r10 + rax + 8], r9b\n.n: inc  rdx\n    jmp  .l\n.d: lea  rax, [rt_btmp]\n    pop  rsi\n    pop  rbx\n    ret\n\nrt_bin_shift:                   ; rcx = &bin, rdx = amount, r8d: 0 shift left, 1 shift right, 2 rotate left, 3 rotate right -> rax = &rt_btmp\n    push rbx\n    push rsi\n    push rdi\n    test rdx, rdx\n    js   rt_err_range\n    mov  rbx, rdx               ; amount\n    mov  r10d, r8d              ; kind\n    mov  rdx, rcx\n    lea  rcx, [rt_bscr]\n    call rt_bin_set             ; (a copy: the source may be rt_btmp itself)\n    lea  rsi, [rt_bscr]\n    lea  rdi, [rt_btmp]\n    mov  r9, [rsi]\n    mov  [rdi], r9\n    lea  r8, [r9 + 7]\n    shr  r8, 3\n    xor  eax, eax\n.z: cmp  rax, r8\n    jae  .zd\n    mov  byte [rdi + rax + 8], 0\n    inc  rax\n    jmp  .z\n.zd:\n    test r9, r9\n    jz   .done\n    cmp  r10d, 2\n    jb   .shiftonly\n    mov  rax, rbx               ; rotates: the amount counts modulo the length\n    xor  edx, edx\n    div  r9\n    mov  rbx, rdx\n    jmp  .go\n.shiftonly:\n    cmp  rbx, r9                ; shifting by the length or more leaves zeros\n    jae  .done\n.go:\n    xor  r11d, r11d             ; bit of the result\n.l: cmp  r11, r9\n    jae  .done\n    mov  rax, r11\n    cmp  r10d, 0\n    je   .shl\n    cmp  r10d, 1\n    je   .shr\n    cmp  r10d, 2\n    je   .rotl\n    add  rax, rbx               ; rotate right: result bit i = source bit (i + n) mod length\n    cmp  rax, r9\n    jb   .have\n    sub  rax, r9\n    jmp  .have\n.rotl:\n    sub  rax, rbx\n    jns  .have\n    add  rax, r9\n    jmp  .have\n.shl:\n    sub  rax, rbx\n    js   .next\n    jmp  .have\n.shr:\n    add  rax, rbx\n    cmp  rax, r9\n    jae  .next\n.have:\n    mov  rdx, rax\n    shr  rdx, 3\n    movzx edx, byte [rsi + rdx + 8]\n    mov  ecx, eax\n    and  ecx, 7\n    shr  edx, cl\n    and  edx, 1\n    jz   .next\n    mov  rax, r11\n    shr  rax, 3\n    mov  ecx, r11d\n    and  ecx, 7\n    mov  edx, 1\n    shl  edx, cl\n    or   [rdi + rax + 8], dl\n.next:\n    inc  r11\n    jmp  .l\n.done:\n    lea  rax, [rt_btmp]\n    pop  rdi\n    pop  rsi\n    pop  rbx\n    ret\n\nrt_bit_copy:                    ; rsi = &source bin, rdi = &destination bin (zeroed), r8 = first destination bit, r9 = number of bits\n    xor  r10d, r10d\n.l: cmp  r10, r9\n    jae  .d\n    mov  rax, r10\n    shr  rax, 3\n    movzx edx, byte [rsi + rax + 8]\n    mov  ecx, r10d\n    and  ecx, 7\n    shr  edx, cl\n    and  edx, 1\n    jz   .n\n    lea  rax, [r8 + r10]\n    mov  r11, rax\n    shr  rax, 3\n    mov  ecx, r11d\n    and  ecx, 7\n    mov  edx, 1\n    shl  edx, cl\n    or   [rdi + rax + 8], dl\n.n: inc  r10\n    jmp  .l\n.d: ret\n\nrt_bin_cat:                     ; rcx = &left, rdx = &right: rt_bacc := the bits of left followed by the bits of right\n    push rbx\n    push rsi\n    push rdi\n    mov  rbx, rdx\n    mov  rsi, rcx\n    mov  rax, [rsi]\n    add  rax, [rbx]\n    cmp  rax, BIN_BYTES * 8\n    ja   rt_err_bin\n    lea  rdi, [rt_bscr]\n    mov  [rdi], rax\n    add  rax, 7\n    shr  rax, 3\n    xor  ecx, ecx\n.z: cmp  rcx, rax\n    jae  .zd\n    mov  byte [rdi + rcx + 8], 0\n    inc  rcx\n    jmp  .z\n.zd:\n    push rsi\n    mov  rsi, rbx               ; the right bin goes in the low bits\n    xor  r8d, r8d\n    mov  r9, [rbx]\n    call rt_bit_copy\n    pop  rsi\n    mov  r8, [rbx]              ; the left bin above it\n    mov  r9, [rsi]\n    call rt_bit_copy\n    lea  rcx, [rt_bacc]\n    lea  rdx, [rt_bscr]\n    call rt_bin_set\n    pop  rdi\n    pop  rsi\n    pop  rbx\n    ret\n\nrt_bin_from_num:                ; rax = number -> rax = &bin of its 64 bits\n    lea  rcx, [rt_bt]\n    mov  qword [rcx], 64\n    mov  [rcx + 8], rax\n    mov  rax, rcx\n    ret\n\nrt_bin_to_num:                  ; rax = &bin -> rax = its lowest 64 bits\n    mov  rcx, [rax]\n    add  rcx, 7\n    shr  rcx, 3\n    cmp  rcx, 8\n    jbe  .1\n    mov  ecx, 8\n.1: xor  edx, edx\n.l: test rcx, rcx\n    jz   .d\n    dec  rcx\n    shl  rdx, 8\n    movzx r8d, byte [rax + rcx + 8]\n    or   rdx, r8\n    jmp  .l\n.d: mov  rax, rdx\n    ret\n\n`
 STR s_rt_sbbin, `\nrt_sb_bin:                      ; rdx = &bin: append  0b  and its bits, most significant first\n    mov  r8, [rdx]\n    mov  rcx, [rt_sb]\n    lea  rax, [rcx + r8 + 2]\n    cmp  rax, LSTR_CAP\n    ja   rt_err_cap\n    mov  [rt_sb], rax\n    lea  r9, [rt_sb + 8]\n    add  r9, rcx\n    mov  byte [r9], '0'\n    mov  byte [r9 + 1], 'b'\n    add  r9, 2\n    xor  r10d, r10d\n.l: cmp  r10, r8\n    jae  .d\n    mov  rax, r8\n    dec  rax\n    sub  rax, r10               ; number of the bit\n    mov  r11, rax\n    shr  r11, 3\n    movzx r11d, byte [rdx + r11 + 8]\n    mov  ecx, eax\n    and  ecx, 7\n    shr  r11d, cl\n    and  r11d, 1\n    add  r11d, '0'\n    mov  [r9 + r10], r11b\n    inc  r10\n    jmp  .l\n.d: ret\n`
 STR s_bin_decl,   `:  dq 1\n    times BIN_BYTES db 0\n`
 STR s_bin_pre,    `bin_`
@@ -400,6 +413,8 @@ write_opd:                      ; the operand (a number or [v_name]) and a newli
 ; Code that leaves the value of the var initialiser (expr_kind) in rax.
 write_expr:
     movzx eax, byte [expr_kind]
+    cmp  eax, EX_DONE
+    je   .done
     cmp  eax, EX_COPY
     je   .copy
     cmp  eax, EX_LSTR_LEN       ; an lstr's label holds its length
@@ -463,6 +478,7 @@ write_expr:
     EMIT s_lea_rcx
     call emit_label_expr
     EMIT s_rbr_nl
+.done:
     ret
 
 ; ---- if / elif / else ----------------------------------------------------------
@@ -653,6 +669,80 @@ write_add_rbx:                  ; rax = rax + rbx
     EMIT s_add_rax_rbx
     ret
 
+write_push_rax:
+    EMIT s_push_rax
+    ret
+
+write_sub_begin:
+    EMIT s_push_rbx
+    ret
+write_pop_swap:
+    EMIT s_pop_swap
+    ret
+write_mov_rax_rbx:
+    EMIT s_mov_rax_rbx
+    ret
+
+; b[pos]: rax = position -> rax = the bit (0 / 1)
+write_bin_idx_end:
+    EMIT s_mov_rdx_rax
+    EMIT s_lea_rcx
+    call emit_label_expr
+    EMIT s_rbr_nl
+    RTCALL RT_BIN, s_call_bin_idx
+    EMIT s_pop_rbx
+    ret
+; b[lo:hi]: lo is on the stack, hi in rax -> rax = &rt_btmp (the slice)
+write_bin_slice_end:
+    EMIT s_mov_r8_rax
+    EMIT s_pop_rdx
+    EMIT s_lea_rcx
+    call emit_label_expr
+    EMIT s_rbr_nl
+    RTCALL RT_BIN, s_call_bin_slice
+    EMIT s_pop_rbx
+    ret
+; the bin to shift is on the stack, the amount in rax; AL = 0 <<  1 >>  2 <<<  3 >>>   ->  rax = &rt_btmp
+write_shift_end:
+    mov  [num_op], al
+    EMIT s_shift_a
+    movzx eax, byte [num_op]
+    call emit_dec
+    RTCALL RT_BIN, s_shift_b
+    ret
+; the left bin is on the stack, the right one in rax: rt_bacc := left , right   -> rax = &rt_bacc
+write_bin_cat:
+    RTCALL RT_BIN, s_bin_cat
+    ret
+
+; the left value is on the stack, the right one in rax; AL = + - * / %   ->  rax = left op right
+write_num_op:
+    mov  [num_op], al
+    EMIT s_pop_swap
+    movzx eax, byte [num_op]
+    cmp  eax, '+'
+    je   .add
+    cmp  eax, '-'
+    je   .sub
+    cmp  eax, '*'
+    je   .mul
+    cmp  eax, '/'
+    je   .div
+    RTCALL RT_DIV, s_call_mod
+    ret
+.add:
+    EMIT s_add_rax_rbx
+    ret
+.sub:
+    EMIT s_sub_rax_rbx
+    ret
+.mul:
+    EMIT s_imul_rax_rbx
+    ret
+.div:
+    RTCALL RT_DIV, s_call_div
+    ret
+
 write_sb_start:                 ; text builder := the value so far (rax, type [ex_cur])
     RTCALL RT_TEXT, s_call_sb_clear
     movzx eax, byte [ex_cur]
@@ -808,10 +898,18 @@ write_def_begin:
     IDL  s_fr, s_b_lbl          ; fr_<id>_b:  start of the function's local variables (.bss)
     EMIT s_sec_data
     IDL  s_fr, s_d_lbl          ; fr_<id>_d:  ... and of its lstr locals (.data)
+    cmp  byte [cur_class], 0
+    je   .fn
+    IDL  s_fr, s_de_lbl         ; a class has no locals: its saved region is empty
+    EMIT s_sec_bss
+    IDL  s_fr, s_be_lbl
+.fn:
     EMIT s_sec_text
     ret
 
 write_param_decl:               ; the parameter in vd_*
+    cmp  byte [vd_type], 5
+    je   .b
     cmp  byte [vd_type], 2
     je   .l
     EMIT s_sec_bss
@@ -824,6 +922,12 @@ write_param_decl:               ; the parameter in vd_*
     call emit_label
     mov  qword [vd_lit_len], 0
     call emit_lstr_body
+    EMIT s_sec_text
+    ret
+.b:
+    EMIT s_sec_data
+    call emit_label
+    EMIT s_bin_decl
     EMIT s_sec_text
     ret
 
@@ -845,20 +949,28 @@ write_def_end:
     IDL  s_fn, s_ret_lbl
     EMIT s_add_rsp40
     EMIT s_ret_ins
+    cmp  byte [cur_class], 0
+    jne  .rv
     EMIT s_sec_bss
     IDL  s_fr, s_be_lbl
     EMIT s_sec_data
     IDL  s_fr, s_de_lbl
+.rv:
     cmp  byte [w_rt], 2
+    je   .rvd
+    cmp  byte [w_rt], 3
     jne  .nr
+.rvd:
     EMIT s_sec_bss
-    IDL  s_rv, s_rv_decl        ; the text a function returns is handed over in rv_<id>
+    IDL  s_rv, s_rv_decl        ; the text (or bin) a function returns is handed over in rv_<id>
 .nr:
     EMIT s_sec_text
     IDL  s_fn, s_skip_lbl
     ret
 
 write_ret_value:                ; EAX = type of the value in rax
+    cmp  eax, 3
+    je   .bin
     cmp  eax, 2
     jne  write_ret_void
     mov  eax, [cur_fn_id]
@@ -868,6 +980,15 @@ write_ret_value:                ; EAX = type of the value in rax
     IDL  s_rv, s_rbr_nl
     or   dword [rt_need], RT_TEXT
     EMIT s_call_lstr_set
+    jmp  .hand
+.bin:
+    mov  eax, [cur_fn_id]
+    mov  [w_id], eax
+    EMIT s_mov_rdx_rax
+    EMIT s_lea_rcx
+    IDL  s_rv, s_rbr_nl
+    RTCALL RT_BIN, s_bin_set
+.hand:
     EMIT s_lea_rax
     IDL  s_rv, s_rbr_nl
 write_ret_void:
@@ -907,9 +1028,12 @@ emit_ca_label:                  ; ca_<site>_<arg>
 write_arg_push:
     cmp  eax, 2
     je   .text
+    cmp  eax, 3
+    je   .text
     EMIT s_push_rax
     ret
-.text:                          ; text is copied to a scratch buffer of this call site first
+.text:                          ; text (and a bin) is copied to a scratch buffer of this call site first
+    mov  [w_aty], al
     mov  [w_idx], ecx
     mov  edx, [ca_n]
     cmp  edx, CA_MAX
@@ -924,8 +1048,14 @@ write_arg_push:
     EMIT s_lea_rcx
     call emit_ca_label
     EMIT s_rbr_nl
+    cmp  byte [w_aty], 3
+    je   .cbin
     or   dword [rt_need], RT_TEXT
     EMIT s_call_lstr_set
+    jmp  .cdone
+.cbin:
+    RTCALL RT_BIN, s_bin_set
+.cdone:
     EMIT s_lea_rax
     call emit_ca_label
     EMIT s_rbr_nl
@@ -935,7 +1065,7 @@ write_arg_push:
     mov  bx, ERR_TABLE_FULL
     jmp  error
 
-emit_param_label:               ; v_<name of parameter [w_idx] of [w_fn]>@<id>
+emit_param_label:               ; v_<name of parameter [w_idx] of [w_fn]>@<id>   (a class: just v_<name>)
     EMIT s_vpre
     mov  r9, [w_fn]
     mov  eax, [w_idx]
@@ -944,10 +1074,15 @@ emit_param_label:               ; v_<name of parameter [w_idx] of [w_fn]>@<id>
     mov  rdx, [r9 + 32]
     mov  r8, [r9 + 40]
     call emit_bytes
+    mov  r9, [w_fn]
+    cmp  byte [r9 + 30], 0
+    jne  .noat
     EMIT s_at
     mov  r9, [w_fn]
     mov  eax, [r9 + 16]
     jmp  emit_dec
+.noat:
+    ret
 
 ; the call itself: arguments are on the stack (last on top)
 write_call_emit:
@@ -998,10 +1133,19 @@ write_call_emit:
     mov  eax, [w_idx]
     cmp  byte [r8 + 22 + rax], 2
     je   .ptext
+    cmp  byte [r8 + 22 + rax], 3
+    je   .pbin
     EMIT s_pop_rax
     EMIT s_store_c
     call emit_param_label
     EMIT s_store_b
+    jmp  .pl
+.pbin:
+    EMIT s_pop_rdx
+    EMIT s_lea_rcx
+    call emit_param_label
+    EMIT s_rbr_nl
+    RTCALL RT_BIN, s_bin_set
     jmp  .pl
 .ptext:
     EMIT s_pop_rdx
@@ -1241,6 +1385,7 @@ out_end:                        ; footer, runtime helpers, then write the file
     RT_IF RT_SBSAVE,      s_rt_sbsave
     RT_IF RT_BIN,         s_rt_bin
     RT_IF RT_SBBIN,       s_rt_sbbin
+    RT_IF RT_DIV,         s_rt_div
     ; fall through
 
 out_flush:
@@ -1372,6 +1517,8 @@ emit_label_p:
     call emit_bytes
     cmp  dword [cur_fn_id], 0
     je   .ret
+    cmp  byte [cur_class], 0    ; a class has no local variables
+    jne  .ret
     push rdi                    ; inside a def: a variable of the def gets  @<id>  after its name
     push rcx
     mov  rdi, [lbl_ptr]

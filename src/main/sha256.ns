@@ -2,168 +2,95 @@
 # It is used primarily for ensuring the security of injected packages.
 # It is written in Nano for readability.
 # It is required for the Nano compiler to compile any other programs.
-
-var int __tint
-var bool __tbool
-var int __h_0 = 0x6a09e667
-var int __h_1 = 0xbb67ae85
-var int __h_2 = 0x3c6ef372
-var int __h_3 = 0xa54ff53a
-var int __h_4 = 0x510e527f
-var int __h_5 = 0x9b05688c
-var int __h_6 = 0x1f839ab9
-var int __h_7 = 0x5be0cd19
-list __k = {0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-}
-
-def rotr(in, amt):
-    tvar int __x = in.length
-    tvar int __o
-    if __x << 1:
-        return 0
-    elif __x == 1:
-        return 1
-    else:
-        __o = in[1],in[2:__x]
-    return __o
-
-def shr(in, amt):
-    tvar int __x = in.length
-    tvar int __o
-    if __x << 1:
-        return 0
-    elif __x == 1:
-        return b\2
-    else:
-        __o = 0,in[1:__x-1]
-    return __o
-
-def choose(x, y, z);
-    bool x and y
-    bool2 x and z
-    bool2 not .out2
-    bool .out xor .out2
-    return bool.out
-
-def major(x, y, z):
-    bool x and y
-    bool2 x and z
-    bool .out xor .out2
-    bool2 y and z
-    bool .out xor .out2
-    return bool.out
-
-def uppersig0(x):
-    tbool = rotr(x,2)
-    bool tbool
-    tbool = rotr(x,13)
-    bool .out xor tbool
-    tbool = rotr(x,22)
-    bool .out xor tbool
-    return bool.out
-
-def uppersig1(x):
-    tbool = rotr(x,6)
-    bool tbool
-    tbool = rotr(x,11)
-    bool .out xor tbool
-    tbool = rotr(x,25)
-    bool .out xor tbool
-    return bool.out
-
-def lowersig0(x):
-    tbool = rotr(x,7)
-    bool tbool
-    tbool = rotr(x,18)
-    bool .out xor tbool
-    tbool = shr(x,3)
-    bool .out xor tbool
-    return bool.out
-    
-def lowersig1(x):
-    tbool = rotr(x,19)
-    bool tbool
-    tbool = rotr(x,25)
-    bool .out xor tbool
-    tbool = shr(x,10)
-    bool .out xor tbool
-    return bool.out
+#
+# call(sha256, data) gives back the 256-bit digest of the bits of `data` (a bin of 1 to 32703 bits) as a bin.
+# The bits are hashed as they are written: 0x616263 is the three bytes "abc".
+# (A bin always has at least one bit, so the empty message can not be given to it.)
 
 class sha256(in):
     var bin __in = in
-    __in = __in,1
-    # This is the padding step. We start by appending a 1 to the end of the input's bit data, zero-extending the string to be 64 bits shy of the next multiple of 512, and using the final 64 bits represent the original length of the string as an integer.
     var int __length = __in.length
+    # This is the padding step. We start by appending a 1 to the end of the input's bit data, zero-extending the string to be 64 bits shy of the next multiple of 512, and using the final 64 bits represent the original length of the string as an integer.
+    __in = __in,1
+    var int __need = __length + 65
     var int __counter = 512
-    var __temp = __in
-    until __counter >> __length:
+    until __counter >= __need:
         __counter += 512
-    for i = __counter - 64:
-       __temp = __temp,0
-    __temp = __temp,b\__length
-    # This is the splitting step. We split the input into 512-bit blocks for processing each block individually later.
-    list __blocks
-    until __i = __temp.length:
-        __blocks.append(__temp[__i:__i + 511])
-        __i += 512
-    # Now we need to break the blocks into words.
-    list __words
-    tvar int __n
-    tvar int __i
-    tvar int __t
-    for __b = __blocks.length:
-        __t = t,__blocks[__b][__i + __n]
-        __n += 1
-        if __n == 32:
-            __n = 0
-            __i += 32
-            __words.append(__t)
-    var int __block
-    list __out_words
-    for __word = __words.length:
-        if __word - {16 * __block} <= 15:
-            __out_words.append(__word)
-        else:
-            __out_words.append(lowersig1(__out_words[__word-2])+{__out_words[__word-7]}+lowersig0(__out_words[__word-15])+__out_words[__word-16])
-        bool not __word == 0
-        bool2 {__word + 1} % 64 == 0
-        if bool.out and bool.out2:
-            __block += 1
-    # Next up is the main working step of the SHA-256 algorithm. This involves iterating over the input data in blocks of 512 bits, processing each block, and updating the hash value accordingly. The algorithm uses a series of bitwise operations and modular arithmetic to achieve this. The final hash value is then returned as the output of the algorithm.
-    var int __a = __h_0
-    var int __b = __h_1
-    var int __c = __h_2
-    var int __d = __h_3
-    var int __e = __h_4
-    var int __f = __h_5
-    var int __g = __h_6
-    var int __h = __h_7
-
-    tvar int __t_1
-    tvar int __t_2
-
-    for b = __blocks.length:
-        for i = 63:
-            __t_1 = h + uppersig1(e) + choose(e,f,g) + __k[i] + __out_words[i+{b*64}]
-            __t_2 = uppersig0(a) + major(a,b,c)
-            h = g
-            g = f
-            f = e
-            e = d
-            d = c
-            c = b
-            b = a
-            a = __t_1 + __t_2
-
-        __h_0 = __h_0 + a
-        __h_1 = __h_1 + b
-        __h_2 = __h_2 + c
-        __h_3 = __h_3 + d
-        __h_4 = __h_4 + e
-        __h_5 = __h_5 + f
-        __h_6 = __h_6 + g
-        __h_7 = __h_7 + h
-
-    var int __final_out = __h_0,__h_1,__h_2,__h_3,__h_4,__h_5,__h_6,__h_7
-    __final_out = h\__final_out
-    return __final_out
+    var int __zeros = __counter - 65 - __length
+    var int __z = 0
+    for __z = __zeros:
+        __in = __in,0
+    __in = __in,b\__length
+    # The constants: the first 32 bits of the fractional parts of the cube roots of the first 64 primes ...
+    var bin __k = 0x428a2f9871374491b5c0fbcfe9b5dba53956c25b59f111f1923f82a4ab1c5ed5
+    __k = __k,0xd807aa9812835b01243185be550c7dc372be5d7480deb1fe9bdc06a7c19bf174
+    __k = __k,0xe49b69c1efbe47860fc19dc6240ca1cc2de92c6f4a7484aa5cb0a9dc76f988da
+    __k = __k,0x983e5152a831c66db00327c8bf597fc7c6e00bf3d5a7914706ca635114292967
+    __k = __k,0x27b70a852e1b21384d2c6dfc53380d13650a7354766a0abb81c2c92e92722c85
+    __k = __k,0xa2bfe8a1a81a664bc24b8b70c76c51a3d192e819d6990624f40e3585106aa070
+    __k = __k,0x19a4c1161e376c082748774c34b0bcb5391c0cb34ed8aa4a5b9cca4f682e6ff3
+    __k = __k,0x748f82ee78a5636f84c878148cc7020890befffaa4506cebbef9a3f7c67178f2
+    # ... and the starting hash: the same for the square roots of the first 8 primes.
+    var bin __hs = 0x6a09e667bb67ae853c6ef372a54ff53a
+    __hs = __hs,0x510e527f9b05688c1f83d9ab5be0cd19
+    # Now we go through the blocks of 512 bits, one at a time.
+    var int __off = 0
+    until __off >= __counter:
+        # The message schedule: the 16 words of the block, then 48 more made from the ones before them. __w holds
+        # all 64 words one after the other (word t is the bits t * 32 to t * 32 + 31).
+        var bin __w = __in[__off : __off + 511]
+        var int __t = 16
+        until __t == 64:
+            var int __p = __t * 32
+            var bin __x = __w[__p - 480 : __p - 449]
+            var bin __s0 = __x >>> 7 xor __x >>> 18 xor __x >> 3
+            __x = __w[__p - 64 : __p - 33]
+            var bin __s1 = __x >>> 17 xor __x >>> 19 xor __x >> 10
+            var bin __nw = __s1 add __w[__p - 224 : __p - 193] add __s0 add __w[__p - 512 : __p - 481]
+            __w = __w,__nw
+            __t += 1
+        # The working variables start as the current hash.
+        var bin __a = __hs[0 : 31]
+        var bin __b = __hs[32 : 63]
+        var bin __c = __hs[64 : 95]
+        var bin __d = __hs[96 : 127]
+        var bin __e = __hs[128 : 159]
+        var bin __f = __hs[160 : 191]
+        var bin __g = __hs[192 : 223]
+        var bin __h = __hs[224 : 255]
+        # The 64 rounds.
+        __t = 0
+        until __t == 64:
+            var int __q = __t * 32
+            var bin __e1 = __e >>> 6 xor __e >>> 11 xor __e >>> 25
+            var bin __ch1 = __e and __f
+            var bin __ch2 = not __e and __g
+            var bin __ch = __ch1 xor __ch2
+            var bin __t1 = __h add __e1 add __ch add __k[__q : __q + 31] add __w[__q : __q + 31]
+            var bin __a1 = __a >>> 2 xor __a >>> 13 xor __a >>> 22
+            var bin __mj1 = __a and __b
+            var bin __mj2 = __a and __c
+            var bin __mj3 = __b and __c
+            var bin __mj = __mj1 xor __mj2 xor __mj3
+            var bin __t2 = __a1 add __mj
+            __h = __g
+            __g = __f
+            __f = __e
+            __e = __d add __t1
+            __d = __c
+            __c = __b
+            __b = __a
+            __a = __t1 add __t2
+            __t += 1
+        # The block's result is added to the hash (every addition wraps at 32 bits).
+        var bin __n0 = __hs[0 : 31] add __a
+        var bin __n1 = __hs[32 : 63] add __b
+        var bin __n2 = __hs[64 : 95] add __c
+        var bin __n3 = __hs[96 : 127] add __d
+        var bin __n4 = __hs[128 : 159] add __e
+        var bin __n5 = __hs[160 : 191] add __f
+        var bin __n6 = __hs[192 : 223] add __g
+        var bin __n7 = __hs[224 : 255] add __h
+        __hs = __n0,__n1,__n2,__n3,__n4,__n5,__n6,__n7
+        __off += 512
+    ret __hs
