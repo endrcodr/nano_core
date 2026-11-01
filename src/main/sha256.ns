@@ -165,5 +165,5 @@ class sha256(in):
         __h_7 = __h_7 + h
 
     var int __final_out = __h_0,__h_1,__h_2,__h_3,__h_4,__h_5,__h_6,__h_7
-
+    __final_out = h\__final_out
     return __final_out
