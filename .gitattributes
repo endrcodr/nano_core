@@ -1,3 +1,6 @@
 *.n linguist-language=Nano
 *.ns linguist-language=NanoSource
 *.nc linguist-language=Nano
+*.npms linguist-language=NanoPackageMetadataStorage
+*.nz linguist-language=NanoZip
+*.nids linguist-language=NanoInformationandDataStorage
