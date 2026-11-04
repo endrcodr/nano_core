@@ -1,5 +1,5 @@
 ; nlang_opener.nasm - reads the .n/.nc/.ns file named on the command line into `buffer`.
-; Included by nlang_main.nasm (do NOT define `main` here).
+; Included by nlang_main.nasm (do NOT define `main` here). It only uses the os_* functions defined there.
 ; main_opener returns EAX = 0 on success, 1 on failure.
 bits 64
 default rel
@@ -7,16 +7,14 @@ default rel
 %define BUFFER_SIZE 6291456
 %define PATH_MAX    520
 
-extern GetCommandLineA
-extern CreateFileA
-extern ReadFile
-extern CloseHandle
-extern ExitProcess
+section .data
+target: db HOST_TARGET          ; 0 = the programs Nano writes are for Windows, 1 = for Linux (--win64 / --linux)
 
 section .bss
-    file_handle resq 1
-    bytes_read  resq 1          ; ReadFile writes a DWORD; qword is zeroed first
+    bytes_read  resq 1
     path_buf    resb PATH_MAX
+    verbose     resb 1              ; 1 with -v / --verbose: show every statement
+    resb 7
     buffer      resb BUFFER_SIZE
 
 section .text
@@ -24,9 +22,9 @@ main_opener:
     push rbx
     push rsi
     push rdi
-    sub  rsp, 64                ; 32 shadow + 3 stack args (CreateFileA has 7 params); keeps 16-byte alignment
+    sub  rsp, 64                ; keeps the 16-byte alignment the os_* functions expect
 
-    call GetCommandLineA
+    call os_cmdline
     mov  rsi, rax
     cmp  byte [rsi], '"'
     je   .quoted_exe
@@ -60,6 +58,60 @@ main_opener:
 .arg:
     test al, al
     jz   .fail                  ; no file argument
+    cmp  al, '-'
+    jne  .path
+    cmp  word [rsi], '-v'       ; flag: -v  or  --verbose  (then a space, or the end)
+    jne  .long_flag
+    movzx eax, byte [rsi + 2]
+    mov  ecx, 2
+    jmp  .flag_end
+.long_flag:
+    cmp  dword [rsi], '--ve'
+    jne  .try_win
+    cmp  dword [rsi + 4], 'rbos'
+    jne  .path
+    cmp  byte [rsi + 8], 'e'
+    jne  .path
+    movzx eax, byte [rsi + 9]
+    mov  ecx, 9
+.flag_end:
+    test al, al
+    jz   .set_verbose
+    cmp  al, ' '
+    jne  .path                  ; e.g. "-vx": just a (bad) file name
+.set_verbose:
+    mov  byte [verbose], 1
+    add  rsi, rcx
+    jmp  .skip_spaces
+.try_win:                       ; --win64
+    cmp  dword [rsi], '--wi'
+    jne  .try_linux
+    cmp  word [rsi + 4], 'n6'
+    jne  .path
+    cmp  byte [rsi + 6], '4'
+    jne  .path
+    xor  edx, edx
+    jmp  .target_end
+.try_linux:                     ; --linux
+    cmp  dword [rsi], '--li'
+    jne  .path
+    cmp  word [rsi + 4], 'nu'
+    jne  .path
+    cmp  byte [rsi + 6], 'x'
+    jne  .path
+    mov  edx, 1
+.target_end:
+    movzx eax, byte [rsi + 7]
+    test al, al
+    jz   .set_target
+    cmp  al, ' '
+    jne  .path
+.set_target:
+    mov  [target], dl
+    add  rsi, 7
+    jmp  .skip_spaces
+.path:
+    mov  al, [rsi]
     lea  rdi, [path_buf]
     lea  rbx, [path_buf + PATH_MAX - 1]
     cmp  al, '"'
@@ -119,32 +171,13 @@ main_opener:
 
 .open:
     lea  rcx, [path_buf]
-    mov  edx, 0x80000000        ; GENERIC_READ
-    mov  r8d, 1                 ; FILE_SHARE_READ
-    xor  r9d, r9d               ; no security attributes
-    mov  qword [rsp + 32], 3    ; OPEN_EXISTING
-    mov  qword [rsp + 40], 0x80 ; FILE_ATTRIBUTE_NORMAL
-    mov  qword [rsp + 48], 0    ; no template
-    call CreateFileA
-    cmp  rax, -1                ; INVALID_HANDLE_VALUE
-    je   .fail
-    mov  [file_handle], rax
-
-    mov  rcx, rax
     lea  rdx, [buffer]
     mov  r8d, BUFFER_SIZE
-    lea  r9,  [bytes_read]
-    mov  qword [bytes_read], 0
-    mov  qword [rsp + 32], 0    ; lpOverlapped = NULL
-    call ReadFile
-    mov  ebx, eax               ; keep result across CloseHandle (rbx is non-volatile)
-
-    mov  rcx, [file_handle]
-    call CloseHandle
-
-    test ebx, ebx
-    jz   .fail
-    cmp  dword [bytes_read], BUFFER_SIZE
+    call os_read_file           ; rax = bytes read, -1 when it can't be read
+    cmp  rax, -1
+    je   .fail
+    mov  [bytes_read], rax
+    cmp  rax, BUFFER_SIZE
     jae  .fail                  ; file too big for the buffer (would be truncated)
     xor  eax, eax
     jmp  .done

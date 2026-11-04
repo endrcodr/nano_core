@@ -2,14 +2,10 @@
 ; Included by nlang_main.nasm AFTER nlang_opener.nasm (needs `buffer` and `bytes_read`).
 ;
 ; Calling convention: compile takes no args, returns EAX = 0 on success, and
-; preserves the Windows non-volatile registers. Compile errors jump to `error`,
+; preserves the non-volatile registers (rbx, rsi, rdi, rbp, r12-r15). Compile errors jump to `error`,
 ; which exits the process with code 0x100 + BX.
 bits 64
 default rel
-
-extern ExitProcess
-extern GetStdHandle
-extern WriteFile
 
 ; ---- statement flags kept in R14 (0 = start of a statement) -----------------
 FN_NONE   equ 0
@@ -166,9 +162,6 @@ section .bss
     ; Messages to the console.
     err_code    resd 1              ; 0x100 + ERR_*
     mb_len      resd 1              ; bytes used in msg_buf
-    pt_ptr      resq 1
-    pt_len      resq 1
-    pt_written  resq 1
     pd_buf      resb 32
     hx_buf      resb 8
     msg_buf     resb 1024
@@ -995,7 +988,7 @@ error:
     sub  rsp, 32
     call print_error
     mov  ecx, [err_code]
-    call ExitProcess
+    jmp  os_exit
 
 %macro PUT 1
     lea  rdx, [%1]
@@ -1044,10 +1037,10 @@ print_error:
     call put_text
 .done:
     PUT  s_msg_nl
-    mov  ecx, -12                        ; STD_ERROR_HANDLE
+    mov  ecx, 2                          ; stderr
     lea  rdx, [msg_buf]
     mov  r8d, [mb_len]
-    jmp  print_text
+    jmp  os_write_std
 
 ; "nlang: wrote <output file>"  -> stdout
 print_ok:
@@ -1071,10 +1064,10 @@ print_ok:
 
 ; send msg_buf to stdout
 flush_stdout:
-    mov  ecx, -11                        ; STD_OUTPUT_HANDLE
+    mov  ecx, 1                          ; stdout
     lea  rdx, [msg_buf]
     mov  r8d, [mb_len]
-    jmp  print_text
+    jmp  os_write_std
 
 ; "nlang: compiling .\script.n (2314 bytes)"   (", package file" for a .ns)
 print_start:
@@ -1219,22 +1212,6 @@ note_stmt:
     pop  rcx
     pop  rbx
 .ret:
-    ret
-
-; in: ECX = -11 (stdout) / -12 (stderr), RDX = text, R8D = length.  Result ignored.
-print_text:
-    sub  rsp, 40                ; entry rsp is 8 mod 16: 32 shadow + 1 stack arg keeps calls aligned
-    mov  [pt_ptr], rdx
-    mov  [pt_len], r8
-    call GetStdHandle
-    mov  rcx, rax
-    mov  rdx, [pt_ptr]
-    mov  r8d, [pt_len]
-    lea  r9, [pt_written]
-    mov  qword [pt_written], 0
-    mov  qword [rsp + 32], 0
-    call WriteFile
-    add  rsp, 40
     ret
 
 ; append RDX/ECX (text, length) to msg_buf
