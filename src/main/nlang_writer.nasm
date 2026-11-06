@@ -31,6 +31,7 @@ RT_BIN         equ 0x2000     ; bit strings: set / operations / compare / conver
 RT_SBBIN       equ 0x4000     ; ... and bin -> text in the builder
 RT_SBSAVE      equ 0x1000     ; keep the text builder across a call
 RT_DIV         equ 0x8000     ; a / b (FPU) and a % b, with the divide-by-zero check
+RT_FS          equ 0x10000    ; the fs. functions (file system)
 
 section .bss
     out_buf    resb OUT_SIZE
@@ -42,6 +43,7 @@ section .bss
     lbl_ptr    resq 1
     lbl_len    resq 1
     w_aty      resb 1
+    fs_nm      resb 32
 
 section .data
 ; (STR is defined in nlang_compiler.nasm, which includes this file)
@@ -181,6 +183,22 @@ STR s_push_rax,  `    push rax\n`
 STR s_push_rbx,  `    push rbx\n`
 STR s_pop_rax,   `    pop  rax\n`
 STR s_pop_rdx,   `    pop  rdx\n`
+STR s_pop_rcx,   `    pop  rcx\n`
+STR s_call_rt,   `    call rt_`
+STR s_fsc_1, `\n; ---- fs. functions (file system) ----\n; The ops take rcx = first argument, rdx = second (lstr addresses) and keep rbx, rsi, rdi, rbp, r12-r15.\n; A failed operation ends the program with 0x208.  Results that are text go to one of two buffers (they alternate).\nsection .bss\nrt_fsp1:  resb 4104\nrt_fsp2:  resb 4104\nrt_fsb1:  resb 4112\nrt_fsb2:  resb 4112\nrt_fsb:   resq 1\nrt_fst:   resq 3\nrt_fsw:   resq 16\nrt_fsck:  resb 8192\nrt_fsst:  resb 144\nsection .text\n\nrt_fs_fail:\n    mov  ecx, 0x208\n    jmp  rt_die\n\nrt_fs_cp:                       ; rcx = lstr, rdx = buffer: a NUL-terminated copy\n    mov  r8, [rcx]\n    cmp  r8, 4095\n    ja   rt_fs_fail\n    lea  r9, [rcx + 8]\n    xor  eax, eax\n.l: cmp  rax, r8\n    jae  .d\n    mov  r11b, [r9 + rax]\n    mov  [rdx + rax], r11b\n    inc  rax\n    jmp  .l\n.d: mov  byte [rdx + rax], 0\n    ret\n\nrt_fs_p1:                       ; rcx = lstr -> rt_fsp1\n    lea  rdx, [rt_fsp1]\n    jmp  rt_fs_cp\n\nrt_fs_p12:                      ; rcx, rdx = lstr -> rt_fsp1, rt_fsp2\n    push rdx\n    lea  rdx, [rt_fsp1]\n    call rt_fs_cp\n    pop  rcx\n    lea  rdx, [rt_fsp2]\n    jmp  rt_fs_cp\n\nrt_fs_nb:                       ; [rt_fsb] = the other result buffer\n    lea  rax, [rt_fsb1]\n    cmp  [rt_fsb], rax\n    jne  .a\n    lea  rax, [rt_fsb2]\n.a: mov  [rt_fsb], rax\n    ret\n\n`
+STR s_fsc_2, `rt_fs_wall:                     ; write rdx[0..r8) to the handle rcx, all of it\n    mov  [rt_fsw + 16], rcx\n    mov  [rt_fsw + 24], rdx\n    mov  [rt_fsw + 32], r8\n.l: cmp  qword [rt_fsw + 32], 0\n    jle  .d\n    mov  rcx, [rt_fsw + 16]\n    mov  rdx, [rt_fsw + 24]\n    mov  r8, [rt_fsw + 32]\n    call rt_sys_write\n    test rax, rax\n    jle  rt_fs_fail\n    add  [rt_fsw + 24], rax\n    sub  [rt_fsw + 32], rax\n    jmp  .l\n.d: ret\n\nrt_fs_copyp:                    ; copy the file rt_fsp1 to rt_fsp2 (replacing it)\n    lea  r8, [rt_fsp1]\n    lea  r9, [rt_fsp2]\n.eq:\n    mov  al, [r8]\n    cmp  al, [r9]\n    jne  .go\n    test al, al\n    jz   .ret                   ; the same path: nothing to do\n    inc  r8\n    inc  r9\n    jmp  .eq\n.go:\n    lea  rcx, [rt_fsp1]\n    call rt_sys_open_r\n    test rax, rax\n    js   rt_fs_fail\n    mov  [rt_fsw], rax\n    lea  rcx, [rt_fsp2]\n    xor  edx, edx\n    call rt_sys_open_w\n    test rax, rax\n    js   rt_fs_fail\n    mov  [rt_fsw + 8], rax\n.rd:\n    mov  rcx, [rt_fsw]\n    lea  rdx, [rt_fsck]\n    mov  r8d, 8192\n    call rt_sys_read\n    test rax, rax\n    js   rt_fs_fail\n    jz   .end\n    mov  r8, rax\n    mov  rcx, [rt_fsw + 8]\n    lea  rdx, [rt_fsck]\n    call rt_fs_wall\n    jmp  .rd\n.end:\n    mov  rcx, [rt_fsw]\n    call rt_sys_close\n    mov  rcx, [rt_fsw + 8]\n    call rt_sys_close\n.ret:\n    ret\n\n`
+STR s_fsc_3, `rt_fs_addname:                  ; rcx = a NUL-terminated name: appended to the result, after a newline\n    mov  r9, [rt_fsb]\n    mov  r8, [r9]\n    add  r9, 8\n    test r8, r8\n    jz   .nosep\n    cmp  r8, 4096\n    jae  .big\n    mov  byte [r9 + r8], 10\n    inc  r8\n.nosep:\n.c: mov  al, [rcx]\n    test al, al\n    jz   .done\n    cmp  r8, 4096\n    jae  .big\n    mov  [r9 + r8], al\n    inc  r8\n    inc  rcx\n    jmp  .c\n.done:\n    mov  r9, [rt_fsb]\n    mov  [r9], r8\n    ret\n.big:\n    mov  ecx, 0x203\n    jmp  rt_die\n\nrt_fs_exists:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_stat\n    test rax, rax\n    setnz al\n    movzx eax, al\n    ret\n\nrt_fs_isdir:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_stat\n    cmp  rax, 2\n    sete al\n    movzx eax, al\n    ret\n\nrt_fs_getsize:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_stat\n    test rax, rax\n    jz   rt_fs_fail\n    mov  rax, [rt_fst + 8]\n    ret\n\nrt_fs_gettime:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_stat\n    test rax, rax\n    jz   rt_fs_fail\n    mov  rax, [rt_fst + 16]\n    ret\n\nrt_fs_create:                   ; makes the file when it is missing, never changes an existing one\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    mov  edx, 2\n    call rt_sys_open_w\n    test rax, rax\n    js   rt_fs_fail\n    mov  rcx, rax\n    jmp  rt_sys_close\n\n`
+STR s_fsc_4, `rt_fs_delete:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_unlink\n    test rax, rax\n    jnz  rt_fs_fail\n    ret\n\nrt_fs_mkdir:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_mkdir\n    test rax, rax\n    jnz  rt_fs_fail\n    ret\n\nrt_fs_rmdir:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_rmdir\n    test rax, rax\n    jnz  rt_fs_fail\n    ret\n\nrt_fs_rename:\n    call rt_fs_p12\n    lea  rcx, [rt_fsp1]\n    lea  rdx, [rt_fsp2]\n    xor  r8d, r8d\n    call rt_sys_rename\n    test rax, rax\n    jnz  rt_fs_fail\n    ret\n\nrt_fs_move:                     ; a rename; when that is not possible (another disk): copy, then delete the original\n    call rt_fs_p12\n    lea  rcx, [rt_fsp1]\n    lea  rdx, [rt_fsp2]\n    mov  r8d, 1\n    call rt_sys_rename\n    test rax, rax\n    jz   .ok\n    call rt_fs_copyp\n    lea  rcx, [rt_fsp1]\n    call rt_sys_unlink\n    test rax, rax\n    jnz  rt_fs_fail\n.ok:\n    ret\n\nrt_fs_copy:\n    call rt_fs_p12\n    jmp  rt_fs_copyp\n\n`
+STR s_fsc_5, `rt_fs_read:\n    call rt_fs_p1\n    call rt_fs_nb\n    lea  rcx, [rt_fsp1]\n    call rt_sys_open_r\n    test rax, rax\n    js   rt_fs_fail\n    mov  [rt_fsw], rax\n    xor  eax, eax\n    mov  [rt_fsw + 8], rax\n.l: mov  rcx, [rt_fsw]\n    mov  rdx, [rt_fsb]\n    add  rdx, 8\n    add  rdx, [rt_fsw + 8]\n    mov  r8d, 4097\n    sub  r8, [rt_fsw + 8]\n    jz   .big\n    call rt_sys_read\n    test rax, rax\n    js   rt_fs_fail\n    jz   .done\n    add  [rt_fsw + 8], rax\n    jmp  .l\n.done:\n    mov  rax, [rt_fsw + 8]\n    cmp  rax, 4096\n    ja   .big\n    mov  rdx, [rt_fsb]\n    mov  [rdx], rax\n    mov  rcx, [rt_fsw]\n    call rt_sys_close\n    mov  rax, [rt_fsb]\n    ret\n.big:\n    mov  ecx, 0x203             ; the file does not fit an lstr\n    jmp  rt_die\n\nrt_fs_write:\n    xor  r8d, r8d\n    jmp  rt_fs_wr\nrt_fs_append:\n    mov  r8d, 1\nrt_fs_wr:                       ; rcx = path, rdx = the text, r8 = 0 write / 1 append\n    push rdx\n    push r8\n    call rt_fs_p1\n    pop  rdx\n    pop  r9\n    mov  [rt_fsw + 40], r9\n    lea  rcx, [rt_fsp1]\n    call rt_sys_open_w\n    test rax, rax\n    js   rt_fs_fail\n    mov  [rt_fsw], rax\n    mov  rcx, rax\n    mov  rdx, [rt_fsw + 40]\n    mov  r8, [rdx]\n    add  rdx, 8\n    call rt_fs_wall\n    mov  rcx, [rt_fsw]\n    jmp  rt_sys_close\n\n`
+STR s_fsc_6, `rt_fs_getdir:\n    call rt_fs_nb\n    mov  rcx, [rt_fsb]\n    add  rcx, 8\n    mov  edx, 4096\n    call rt_sys_getcwd\n    test rax, rax\n    jle  rt_fs_fail\n    mov  rdx, [rt_fsb]\n    mov  [rdx], rax\n    mov  rax, rdx\n    ret\n\nrt_fs_list:\n    call rt_fs_p1\n    call rt_fs_nb\n    mov  rax, [rt_fsb]\n    mov  qword [rax], 0\n    lea  rcx, [rt_fsp1]\n    call rt_sys_list\n    test rax, rax\n    js   rt_fs_fail\n    mov  rax, [rt_fsb]\n    ret\n\n\n`
+STR s_fsl_1, `\n; ---- fs. on Linux: system calls ----\nsection .bss\nrt_fsdent: resb 8192\nsection .text\n\nrt_sys_open_r:                  ; rcx = path -> fd, or negative\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    xor  esi, esi\n    xor  edx, edx\n    mov  eax, 2\n    syscall\n    pop  rsi\n    pop  rdi\n    ret\n\nrt_sys_open_w:                  ; rcx = path, rdx = 0 truncate / 1 append / 2 create only\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    mov  esi, 0x241\n    cmp  edx, 1\n    jne  .n1\n    mov  esi, 0x441\n.n1:\n    cmp  edx, 2\n    jne  .go\n    mov  esi, 0x41\n.go:\n    mov  edx, 0x1A4\n    mov  eax, 2\n    syscall\n    pop  rsi\n    pop  rdi\n    ret\n\nrt_sys_read:                    ; rcx = fd, rdx = buffer, r8 = count -> bytes, or negative\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    mov  rsi, rdx\n    mov  rdx, r8\n    xor  eax, eax\n    syscall\n    pop  rsi\n    pop  rdi\n    ret\n\nrt_sys_write:\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    mov  rsi, rdx\n    mov  rdx, r8\n    mov  eax, 1\n    syscall\n    pop  rsi\n    pop  rdi\n    ret\n\nrt_sys_close:\n    push rdi\n    mov  rdi, rcx\n    mov  eax, 3\n    syscall\n    pop  rdi\n    ret\n\nrt_sys_unlink:                  ; rcx = path -> 0 or negative\n    push rdi\n    mov  rdi, rcx\n    mov  eax, 87\n    syscall\n    pop  rdi\n    ret\n\nrt_sys_rmdir:\n    push rdi\n    mov  rdi, rcx\n    mov  eax, 84\n    syscall\n    pop  rdi\n    ret\n\n`
+STR s_fsl_2, `rt_sys_mkdir:\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    mov  esi, 0x1ED\n    mov  eax, 83\n    syscall\n    pop  rsi\n    pop  rdi\n    ret\n\nrt_sys_rename:                  ; rcx = old, rdx = new\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    mov  rsi, rdx\n    mov  eax, 82\n    syscall\n    pop  rsi\n    pop  rdi\n    ret\n\nrt_sys_stat:                    ; rcx = path -> 0 none / 1 file / 2 directory; rt_fst = kind, size, mtime\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    lea  rsi, [rt_fsst]\n    mov  eax, 4\n    syscall\n    test rax, rax\n    js   .none\n    mov  rax, [rt_fsst + 48]\n    mov  [rt_fst + 8], rax\n    mov  rax, [rt_fsst + 88]\n    mov  [rt_fst + 16], rax\n    mov  eax, [rt_fsst + 24]\n    and  eax, 0xF000\n    mov  ecx, 1\n    cmp  eax, 0x4000\n    jne  .k\n    mov  ecx, 2\n.k: mov  [rt_fst], rcx\n    mov  eax, ecx\n    pop  rsi\n    pop  rdi\n    ret\n.none:\n    xor  eax, eax\n    mov  [rt_fst], rax\n    pop  rsi\n    pop  rdi\n    ret\n\nrt_sys_getcwd:                  ; rcx = buffer, rdx = size -> length, or <= 0\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    mov  rsi, rdx\n    mov  eax, 79\n    syscall\n    test rax, rax\n    jle  .r\n    dec  rax                    ; the call counts the NUL\n.r: pop  rsi\n    pop  rdi\n    ret\n\n`
+STR s_fsl_3, `rt_sys_list:                    ; rcx = directory -> 0, or negative; the names go to the result buffer\n    push rdi\n    push rsi\n    mov  rdi, rcx\n    mov  esi, 0x10000           ; O_DIRECTORY\n    xor  edx, edx\n    mov  eax, 2\n    syscall\n    test rax, rax\n    js   .out\n    mov  [rt_fsw + 48], rax\n.rd:\n    mov  rdi, [rt_fsw + 48]\n    lea  rsi, [rt_fsdent]\n    mov  edx, 8192\n    mov  eax, 217               ; getdents64\n    syscall\n    test rax, rax\n    js   .bad\n    jz   .done\n    mov  [rt_fsw + 56], rax\n    mov  qword [rt_fsw + 64], 0\n.ent:\n    mov  r8, [rt_fsw + 64]\n    cmp  r8, [rt_fsw + 56]\n    jae  .rd\n    lea  r9, [rt_fsdent]\n    add  r9, r8\n    movzx eax, word [r9 + 16]\n    add  r8, rax\n    mov  [rt_fsw + 64], r8\n    lea  rcx, [r9 + 19]\n    cmp  byte [rcx], '.'\n    jne  .add\n    cmp  byte [rcx + 1], 0\n    je   .ent\n    cmp  byte [rcx + 1], '.'\n    jne  .add\n    cmp  byte [rcx + 2], 0\n    je   .ent\n.add:\n    call rt_fs_addname\n    jmp  .ent\n.done:\n    mov  rdi, [rt_fsw + 48]\n    mov  eax, 3\n    syscall\n    xor  eax, eax\n    jmp  .out\n.bad:\n    mov  rdi, [rt_fsw + 48]\n    mov  eax, 3\n    syscall\n    mov  rax, -1\n.out:\n    pop  rsi\n    pop  rdi\n    ret\n\n\n`
+STR s_fsw_1, `\n; ---- fs. on Windows: kernel32 ----\nextern CreateFileA\nextern ReadFile\nextern WriteFile\nextern CloseHandle\nextern DeleteFileA\nextern MoveFileExA\nextern CreateDirectoryA\nextern RemoveDirectoryA\nextern GetFileAttributesExA\nextern GetCurrentDirectoryA\nextern FindFirstFileA\nextern FindNextFileA\nextern FindClose\nsection .bss\nrt_fsfd: resb 320\nrt_fsn:  resq 1\nsection .text\n\nrt_sys_open_r:  ; rcx = path -> handle, or negative\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    mov  edx, 0x80000000\n    mov  r8d, 3\n    xor  r9d, r9d\n    mov  qword [rsp + 32], 3\n    mov  qword [rsp + 40], 0x80\n    mov  qword [rsp + 48], 0\n    call CreateFileA\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\nrt_sys_open_w:  ; rcx = path, rdx = 0 truncate / 1 append / 2 create only\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    mov  eax, edx\n    mov  edx, 0x40000000\n    mov  qword [rsp + 32], 4\n    test eax, eax\n    jnz  .m1\n    mov  qword [rsp + 32], 2\n    jmp  .go\n.m1:\n    cmp  eax, 1\n    jne  .go\n    mov  edx, 4                 ; FILE_APPEND_DATA\n.go:\n    mov  r8d, 3\n    xor  r9d, r9d\n    mov  qword [rsp + 40], 0x80\n    mov  qword [rsp + 48], 0\n    call CreateFileA\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\n`
+STR s_fsw_2, `rt_sys_read:  ; rcx = handle, rdx = buffer, r8 = count -> bytes, or negative\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    lea  r9, [rt_fsn]\n    mov  qword [rsp + 32], 0\n    call ReadFile\n    test eax, eax\n    jz   .f\n    mov  eax, [rt_fsn]\n    jmp  .o\n.f: mov  rax, -1\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\nrt_sys_write:  ; rcx = handle, rdx = buffer, r8 = count -> bytes, or negative\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    lea  r9, [rt_fsn]\n    mov  qword [rsp + 32], 0\n    call WriteFile\n    test eax, eax\n    jz   .f\n    mov  eax, [rt_fsn]\n    jmp  .o\n.f: mov  rax, -1\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\nrt_sys_close:\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    call CloseHandle\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\nrt_sys_unlink:  ; rcx = path -> 0, or negative\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    call DeleteFileA\n    test eax, eax\n    jz   .f\n    xor  eax, eax\n    jmp  .o\n.f: mov  rax, -1\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\nrt_sys_rmdir:\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    call RemoveDirectoryA\n    test eax, eax\n    jz   .f\n    xor  eax, eax\n    jmp  .o\n.f: mov  rax, -1\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\n`
+STR s_fsw_3, `rt_sys_mkdir:\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    xor  edx, edx\n    call CreateDirectoryA\n    test eax, eax\n    jz   .f\n    xor  eax, eax\n    jmp  .o\n.f: mov  rax, -1\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\nrt_sys_rename:  ; rcx = old, rdx = new, r8 = 1: may copy to another disk\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    test r8d, r8d\n    mov  r8d, 1                 ; MOVEFILE_REPLACE_EXISTING\n    jz   .g\n    mov  r8d, 3                 ; + MOVEFILE_COPY_ALLOWED\n.g: call MoveFileExA\n    test eax, eax\n    jz   .f\n    xor  eax, eax\n    jmp  .o\n.f: mov  rax, -1\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\n`
+STR s_fsw_4, `rt_sys_stat:  ; rcx = path -> 0 none / 1 file / 2 directory; rt_fst = kind, size, mtime\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    xor  edx, edx\n    lea  r8, [rt_fsst]\n    call GetFileAttributesExA\n    test eax, eax\n    jz   .none\n    mov  eax, [rt_fsst + 32]\n    mov  edx, [rt_fsst + 28]\n    shl  rdx, 32\n    or   rax, rdx\n    mov  [rt_fst + 8], rax\n    mov  rax, [rt_fsst + 20]    ; FILETIME (100 ns since 1601) -> Unix seconds\n    xor  edx, edx\n    mov  rcx, 10000000\n    div  rcx\n    mov  rcx, 11644473600\n    sub  rax, rcx\n    mov  [rt_fst + 16], rax\n    mov  ecx, 1\n    test dword [rt_fsst], 0x10\n    jz   .k\n    mov  ecx, 2\n.k: mov  [rt_fst], rcx\n    mov  eax, ecx\n    jmp  .o\n.none:\n    xor  eax, eax\n    mov  [rt_fst], rax\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\nrt_sys_getcwd:  ; rcx = buffer, rdx = size -> length, or <= 0\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    mov  r8, rcx\n    mov  ecx, edx\n    mov  rdx, r8\n    call GetCurrentDirectoryA\n    test eax, eax\n    jz   .f\n    cmp  eax, 4096\n    jae  .f\n    jmp  .o\n.f: mov  rax, -1\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\n`
+STR s_fsw_5, `rt_sys_list:  ; rcx = directory -> 0, or negative; the names go to the result buffer\n    push rbp\n    mov  rbp, rsp\n    and  rsp, -16\n    sub  rsp, 64\n    mov  r8, rcx                ; the pattern: <directory>\\*\n    lea  r9, [rt_fsp2]\n    xor  eax, eax\n.cp:\n    mov  dl, [r8 + rax]\n    mov  [r9 + rax], dl\n    inc  rax\n    test dl, dl\n    jnz  .cp\n    dec  rax\n    test rax, rax\n    jz   .star\n    mov  dl, [r9 + rax - 1]\n    cmp  dl, '\\'\n    je   .star\n    cmp  dl, '/'\n    je   .star\n    mov  byte [r9 + rax], '\\'\n    inc  rax\n.star:\n    mov  byte [r9 + rax], '*'\n    mov  byte [r9 + rax + 1], 0\n    lea  rcx, [rt_fsp2]\n    lea  rdx, [rt_fsfd]\n    call FindFirstFileA\n    cmp  rax, -1\n    je   .bad\n    mov  [rt_fsw + 48], rax\n.ent:\n    lea  rcx, [rt_fsfd + 44]\n    cmp  byte [rcx], '.'\n    jne  .add\n    cmp  byte [rcx + 1], 0\n    je   .next\n    cmp  byte [rcx + 1], '.'\n    jne  .add\n    cmp  byte [rcx + 2], 0\n    je   .next\n.add:\n    call rt_fs_addname\n.next:\n    mov  rcx, [rt_fsw + 48]\n    lea  rdx, [rt_fsfd]\n    call FindNextFileA\n    test eax, eax\n    jnz  .ent\n    mov  rcx, [rt_fsw + 48]\n    call FindClose\n    xor  eax, eax\n    jmp  .o\n.bad:\n    mov  rax, -1\n.o:\n    mov  rsp, rbp\n    pop  rbp\n    ret\n\n\n\n`
 STR s_pop_rbx,   `    pop  rbx\n`
 STR s_cmp_fa,    `    cmp  qword [fa_`
 STR s_inc_fa,    `    inc  qword [fa_`
@@ -1083,9 +1101,45 @@ emit_param_label:               ; v_<name of parameter [w_idx] of [w_fn]>@<id>  
     ret
 
 ; the call itself: arguments are on the stack (last on top)
+; fs.xxx: the arguments are on the stack (the last one on top); the result comes back in rax
+write_fs_emit:
+    or   dword [rt_need], RT_FS
+    mov  r8, [w_fn]
+    movzx eax, byte [r8 + 20]
+    cmp  eax, 2
+    jb   .one
+    EMIT s_pop_rdx
+.one:
+    mov  r8, [w_fn]
+    cmp  byte [r8 + 20], 0
+    je   .name
+    EMIT s_pop_rcx
+.name:
+    EMIT s_call_rt
+    mov  r8, [w_fn]
+    mov  rdx, [r8]              ; the name: "fs.read" -> fs_read
+    mov  rcx, [r8 + 8]
+    lea  r9, [fs_nm]
+    xor  eax, eax
+.c: mov  r10b, [rdx + rax]
+    cmp  r10b, '.'
+    jne  .k
+    mov  r10b, '_'
+.k: mov  [r9 + rax], r10b
+    inc  rax
+    cmp  rax, rcx
+    jb   .c
+    mov  rdx, r9
+    mov  r8, rcx
+    call emit_bytes
+    EMIT s_nl
+    ret
+
 write_call_emit:
     mov  r8, [w_fn]
     mov  eax, [r8 + 16]
+    cmp  eax, FS_ID_BASE
+    jae  write_fs_emit
     mov  [w_id], eax
     or   dword [rt_need], RT_FRAMES
     EMIT s_cmp_fa               ; the function is running already: keep its variables
@@ -1175,6 +1229,27 @@ write_call_emit:
     EMIT s_call_frest
     EMIT s_call_frest
     SITEL s_cs, s_b_lbl2
+    ret
+
+write_fs_rt:                    ; the runtime of the fs. functions: shared part, then the part of the target
+    EMIT s_fsc_1
+    EMIT s_fsc_2
+    EMIT s_fsc_3
+    EMIT s_fsc_4
+    EMIT s_fsc_5
+    EMIT s_fsc_6
+    cmp  byte [target], 0
+    jne  .lin
+    EMIT s_fsw_1
+    EMIT s_fsw_2
+    EMIT s_fsw_3
+    EMIT s_fsw_4
+    EMIT s_fsw_5
+    ret
+.lin:
+    EMIT s_fsl_1
+    EMIT s_fsl_2
+    EMIT s_fsl_3
     ret
 
 write_ca_scratch:               ; the scratch buffers of text arguments
@@ -1402,6 +1477,10 @@ out_end:                        ; footer, runtime helpers, then write the file
     RT_IF RT_BIN,         s_rt_bin
     RT_IF RT_SBBIN,       s_rt_sbbin
     RT_IF RT_DIV,         s_rt_div
+    test dword [rt_need], RT_FS
+    jz   .nofs
+    call write_fs_rt
+.nofs:
     ; fall through
 
 out_flush:

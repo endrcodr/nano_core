@@ -28,6 +28,8 @@ FN_ASSIGN   equ 17              ; x = expr / x += expr / x -= expr / name(args)
 FN_RET      equ 18              ; ret [value]
 FN_CLASS    equ 19              ; class name:
 FN_MAX      equ 64              ; functions per program
+FS_ID_BASE  equ 0x1000          ; function ids from here on are the built-in fs. functions
+FS_COUNT    equ 16
 FN_SIZE     equ 160             ; bytes per function record (see "functions" below)
 MAX_PARAMS  equ 8
 CA_MAX      equ 128             ; text (lstr) arguments in the whole program
@@ -104,7 +106,8 @@ ERR_RET_OUTSIDE        equ 30   ; ret outside a def
 ERR_BIN_TOO_BIG        equ 31   ; bin literal longer than BIN_BITS
 ERR_BIN_LOCAL          equ 32   ; bin variable inside a def
 ERR_CLASS_CALL        equ 33   ; a class is run with call(name), a def with name(args)
-ERR_COUNT              equ 29   ; number of messages in err_msgs (codes 5..30)
+ERR_FS_UNKNOWN         equ 34   ; fs.name is not an fs. function (or is not available yet)
+ERR_COUNT              equ 30   ; number of messages in err_msgs (codes 5..34)
 
 VAR_TABLE_SIZE equ 0x10000
 
@@ -221,6 +224,7 @@ section .bss
     fn_ids      resd 1              ; functions seen so far: their number is used in the labels
     fn_count    resd 1
     call_ctr    resd 1              ; call sites so far
+    call_np     resb 1              ; the next parse_call reads its arguments without parentheses (fs.write a, b)
     w_id        resd 1
     w_site      resd 1
     w_idx       resd 1
@@ -261,6 +265,57 @@ kw_table:
 ; "mem." and "fs." families are matched by prefix in match_keyword.
 
 zero_char: db '0'               ; default value of an uninitialised str / lstr
+
+; ---- the fs. functions: records like the ones of a def (see "functions"), parameters and result are text / numbers ----
+%assign FS_I 0
+%macro FSREC 5              ; name, id, number of parameters, result type (0xFE: none), type of every parameter
+    dq fs_names + 12 * FS_I
+    dq %strlen(%1)
+    dd %2
+    db %3, %4
+    times 8 db %5
+    db 0, 0
+    times 128 db 0
+%assign FS_I FS_I + 1
+%endmacro
+%macro FSNM 1
+    db %1
+    times 12 - %strlen(%1) db 0
+%endmacro
+fs_names:
+    FSNM "fs.create"
+    FSNM "fs.delete"
+    FSNM "fs.move"
+    FSNM "fs.copy"
+    FSNM "fs.rename"
+    FSNM "fs.read"
+    FSNM "fs.write"
+    FSNM "fs.append"
+    FSNM "fs.list"
+    FSNM "fs.exists"
+    FSNM "fs.isdir"
+    FSNM "fs.mkdir"
+    FSNM "fs.rmdir"
+    FSNM "fs.getdir"
+    FSNM "fs.getsize"
+    FSNM "fs.gettime"
+fs_table:
+    FSREC "fs.create", FS_ID_BASE + 0, 1, 254, 2
+    FSREC "fs.delete", FS_ID_BASE + 1, 1, 254, 2
+    FSREC "fs.move", FS_ID_BASE + 2, 2, 254, 2
+    FSREC "fs.copy", FS_ID_BASE + 3, 2, 254, 2
+    FSREC "fs.rename", FS_ID_BASE + 4, 2, 254, 2
+    FSREC "fs.read", FS_ID_BASE + 5, 1, 2, 2
+    FSREC "fs.write", FS_ID_BASE + 6, 2, 254, 2
+    FSREC "fs.append", FS_ID_BASE + 7, 2, 254, 2
+    FSREC "fs.list", FS_ID_BASE + 8, 1, 2, 2
+    FSREC "fs.exists", FS_ID_BASE + 9, 1, 0, 2
+    FSREC "fs.isdir", FS_ID_BASE + 10, 1, 0, 2
+    FSREC "fs.mkdir", FS_ID_BASE + 11, 1, 254, 2
+    FSREC "fs.rmdir", FS_ID_BASE + 12, 1, 254, 2
+    FSREC "fs.getdir", FS_ID_BASE + 13, 0, 2, 2
+    FSREC "fs.getsize", FS_ID_BASE + 14, 1, 0, 2
+    FSREC "fs.gettime", FS_ID_BASE + 15, 1, 0, 2
 
 ; STR name, text  ->  name: db text   /   name_len equ <length>      (also used by the writer)
 %macro STR 2
@@ -304,6 +359,7 @@ err_msgs:
     MSG "binary literal is longer than 32768 bits"              ; 31
     MSG "bin variables can only be declared outside a def (they can still be used inside one)" ; 32
     MSG "a class is run with call(name); a def is called as name(args)" ; 33
+    MSG "unknown fs. function (zip, unzip, secure, unsecure and the permission / owner functions are not available yet)" ; 34
 
 STR s_msg_err,  "nlang: error 0x"
 STR s_msg_line, " (line "
@@ -363,6 +419,9 @@ section .text
 ; mem.clear 0xXXXXX:0xYYYYY - Clears the memory from the address represented here as '0xXXXXX' to the address represented here as '0xYYYYY'.
 ; mem.copy 0xXXXXX, 0xYYYYY - Copies the memory from the address represented here as '0xXXXXX' to the address represented here as '0xYYYYY'.
 ; fs. functions - Functions that allow the user to manipulate files, such as creating, deleting, and moving files. These functions are as follows:
+; (WORKING: create delete move copy rename read write append list exists isdir mkdir rmdir getdir getsize gettime.
+;  Statements are written  fs.write 'a.txt', 'text'  (or with parentheses); values need parentheses:  var lstr t = fs.read('a.txt')
+;  See "fs.xxx" at the fs_table.  NOT YET: zip unzip secure unsecure getperm setperm modperm getowner setowner getsecure setsecure.)
 ; fs.create @@@ - Creates a file with the name represented here as '@@@'.
 ; fs.delete @@@ - Deletes a file with the name represented here as '@@@'.
 ; fs.move @@@, @@@ - Moves a file from the first location represented here as '@@@' to the second location represented here as '@@@'.
@@ -607,6 +666,8 @@ compile:
     je   .class_stmt
     cmp  eax, FN_RET
     je   .ret_stmt
+    cmp  eax, FN_FS
+    je   .fs_stmt
     jmp  .func_logic
 .opaque:
     mov  dword [cb_chain], 0
@@ -839,6 +900,29 @@ compile:
     jmp  .stmt_done
 .err_ret_outside:
     mov  bx, ERR_RET_OUTSIDE
+    jmp  error
+
+; ---- fs.name args   or   fs.name(args)   as a statement ------------------------------------
+.fs_stmt:                       ; RDI / RCX = the token, RSI just past it
+    call fs_find
+    test rax, rax
+    jz   .err_fs_unknown
+    mov  [call_fn], rax
+    call skip_blanks
+    mov  byte [call_np], 1
+    cmp  rsi, r12
+    jae  .fs_go
+    cmp  byte [rsi], '('
+    jne  .fs_go
+    inc  rsi
+    mov  byte [call_np], 0
+.fs_go:
+    mov  al, 1                  ; a value that is not used is fine
+    call parse_call
+    call expect_end
+    jmp  .stmt_done
+.err_fs_unknown:
+    mov  bx, ERR_FS_UNKNOWN
     jmp  error
 
 ; ---- a call as a statement: name(args) ---------------------------------------------
@@ -1147,6 +1231,8 @@ note_stmt:
     cmp  r14d, FN_UNTIL
     je   .compiled
     cmp  r14d, FN_FOR
+    je   .compiled
+    cmp  r14d, FN_FS
     je   .compiled
     inc  dword [skip_count]
     mov  byte [ns_flag], 1
@@ -2990,6 +3076,28 @@ parse_call_target:
     mov  bx, ERR_CLASS_CALL
     jmp  error
 
+; in: RDI = token, RCX = length   out: RAX = the record of that fs. function, or 0
+fs_find:
+    lea  rdx, [fs_table]
+    mov  r8d, FS_COUNT
+.n: cmp  [rdx + 8], rcx
+    jne  .s
+    mov  r9, [rdx]
+    xor  r10d, r10d
+.c: mov  al, [r9 + r10]
+    cmp  al, [rdi + r10]
+    jne  .s
+    inc  r10
+    cmp  r10, rcx
+    jb   .c
+    mov  rax, rdx
+    ret
+.s: add  rdx, FN_SIZE
+    dec  r8d
+    jnz  .n
+    xor  eax, eax
+    ret
+
 ; RSI is at a name. When it is a function followed by '(' : consume both, [call_fn] = the record, EAX = 1.
 ; Otherwise nothing is consumed and EAX = 0.
 try_call:
@@ -2997,6 +3105,32 @@ try_call:
     call read_ident
     test rcx, rcx
     jz   .no
+    cmp  rcx, 4
+    jb   .nofs
+    cmp  word [rdi], 'fs'       ; fs.name( args ): a file system function that gives a value
+    jne  .nofs
+    cmp  byte [rdi + 2], '.'
+    jne  .nofs
+    call fs_find
+    test rax, rax
+    jz   .fs_unknown
+    mov  [call_fn], rax
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .fs_syntax
+    cmp  byte [rsi], '('
+    jne  .fs_syntax
+    inc  rsi
+    add  rsp, 8
+    mov  eax, 1
+    ret
+.fs_unknown:
+    mov  bx, ERR_FS_UNKNOWN
+    jmp  error
+.fs_syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.nofs:
     cmp  rcx, 4                 ; call( NAME, args ): runs a class and gives its value
     jne  .not_call
     cmp  dword [rdi], 'call'
@@ -3041,7 +3175,11 @@ try_call:
 parse_call:
     push rbp
     movzx eax, al
-    push rax                    ; +104 allow
+    movzx edx, byte [call_np]   ; fs.name a, b: no parentheses, the statement end closes the call
+    shl  edx, 8
+    or   eax, edx
+    mov  byte [call_np], 0
+    push rax                    ; +104 allow (byte), +105 no parentheses
     push qword [call_fn]        ; +96  the function
     movzx eax, byte [ex_cur]
     push rax                    ; +88
@@ -3087,9 +3225,15 @@ parse_call:
 .nosb:
     mov  byte [ex_noc], 1
     call skip_blanks
+    cmp  byte [rbp + 105], 0
+    jne  .np_first
     cmp  rsi, r12
     jae  .syntax
     cmp  byte [rsi], ')'
+    je   .close
+    jmp  .arg
+.np_first:
+    call .at_end
     je   .close
 .arg:
     mov  r8, [rbp + 96]         ; a bin parameter: 0x... in the argument is read as bits
@@ -3126,13 +3270,15 @@ parse_call:
     inc  qword [rbp]
     call skip_blanks
     cmp  rsi, r12
-    jae  .syntax
+    jae  .arg_eof
     mov  al, [rsi]
     cmp  al, ','
     jne  .chk_close
     inc  rsi
     jmp  .arg
 .chk_close:
+    cmp  byte [rbp + 105], 0
+    jne  .np_end
     cmp  al, ')'
     jne  .syntax
 .close:
@@ -3140,7 +3286,10 @@ parse_call:
     movzx edx, byte [r8 + 20]
     cmp  [rbp], rdx
     jne  .argcount
+    cmp  byte [rbp + 105], 0
+    jne  .no_paren
     inc  rsi
+.no_paren:
     mov  [w_fn], r8
     mov  eax, [rbp + 8]
     mov  [w_site], eax
@@ -3187,7 +3336,7 @@ parse_call:
     mov  eax, r9d
     ret
 .novalue:
-    cmp  qword [rbp + 104], 0   ; allowed as a statement
+    cmp  byte [rbp + 104], 0    ; allowed as a statement
     jne  .restore_void
     cmp  r9d, 0xFF
     jne  .mismatch
@@ -3198,6 +3347,28 @@ parse_call:
 .restore_void:
     mov  r9d, 0xFE
     jmp  .restore
+.arg_eof:                      ; the text ended after an argument
+    cmp  byte [rbp + 105], 0
+    jne  .close
+    jmp  .syntax
+.np_end:                        ; without parentheses the call ends where the statement ends
+    call .at_end
+    je   .close
+    jmp  .syntax
+.at_end:                        ; ZF = 1 at the end of the statement
+    cmp  rsi, r12
+    jae  .yes0
+    mov  al, [rsi]
+    cmp  al, 0x0A
+    je   .yes
+    cmp  al, 0x0D
+    je   .yes
+    cmp  al, '#'
+.yes:
+    ret
+.yes0:
+    cmp  eax, eax
+    ret
 .argcount:
     mov  bx, ERR_ARG_COUNT
     jmp  error
