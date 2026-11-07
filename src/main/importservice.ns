@@ -1,1 +1,11 @@
 i\ sha256.ns
+
+class import(package):
+    tvar lstr error
+    bool fs.exists(package,".ns")
+    bool2 fs.exists(package,"-injector.npms")
+    bool .out or .out2
+    if not bool.out:
+        error = "packageNotFound"
+        return error
+    
