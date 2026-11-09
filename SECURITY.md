@@ -7,4 +7,4 @@ currently being supported with security updates.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.0 | ------ |
+| 0.1.0-a | N/A |
