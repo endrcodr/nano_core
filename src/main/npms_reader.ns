@@ -1,0 +1,11 @@
+class extract_npms(path,target): # Path points to the file. Target can be used to search for one or more specific parameters.
+	tvar lstr __out
+	if not fs.exists(path):
+		__out = "pathNotFound"
+		return __out
+	elif path.length < 6:
+		__out = "incorrectExtension"
+	elif not path[{path.length-4}:{path.length}] = ".npms":
+		__out = "incorrectExtension
+		return __out
+	
