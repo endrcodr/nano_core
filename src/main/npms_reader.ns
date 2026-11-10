@@ -1,4 +1,4 @@
-class extract_npms(path,target): # Path points to the file. Target can be used to search for one or more specific parameters. Target can also be left empty to return a list instead.
+class extract_npms(path,target,vov): # Path points to the file. Target can be used to search for one or more specific parameters. Target can also be left empty to return a list instead. Vov is used to determine whether the script should output the .npms file's variable names or variable content ONLY when no target is set.
 	tvar lstr __out
 	if not fs.exists(path):
 		__out = "pathNotFound"
@@ -10,7 +10,46 @@ class extract_npms(path,target): # Path points to the file. Target can be used t
 		return __out
 	index(path)
 	if not target = "":
+		for __i = __vars.length:
+			if __vars[__i] == target:
+				__out = __vals[__i]
+				return __out
+		__out = "notFound"
+		return __out
+	else:
+		if vov == "names":
+			return __vars
+		elif vov == "values":
+			return __vals
+		elif vov == "vals":
+			return __vals
+		else:
+			__out = "invalidVOVOption"
+			return __out
 		
 
 private class index(path):
-	
+	tvar lstr __file = fs.open(path) # Open the file and store it in the temporary variable
+	list __vars
+	list __vals
+	tvar str __flags
+	for __i = __file.length:
+		if __file[__i] == """
+		""":
+			__flags = "nL"
+		elif __file[__i] == "=":
+			__flags = "equ"
+		elif __file[__i] == '"':
+			if __flags = "val":
+			tvar int __t
+			tvar lstr __v
+			until __file[__t-1] == '"':
+				__v = __v,{__file[__t]}
+				__t += 1
+			__vals.append(__v)
+		if __flags = "equ":
+			tvar int __t = __i
+			tvar lstr __v
+			until __file[__t-1] == "	":
+				__v = __v,{__file[__t]}
+				__t += 1
