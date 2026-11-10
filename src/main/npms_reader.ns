@@ -3,7 +3,7 @@ class extract_npms(path,target,vov): # Path points to the file. Target can be us
 	if not fs.exists(path):
 		__out = "pathNotFound"
 		return __out
-	elif path.length < 6:
+	elif path.length << 6:
 		__out = "incorrectExtension"
 	elif not path[{path.length-4}:{path.length}] = ".npms":
 		__out = "incorrectExtension
@@ -47,7 +47,7 @@ private class index(path):
 				__v = __v,{__file[__t]}
 				__t += 1
 			__vals.append(__v)
-		if __flags = "equ":
+		if __flags == "equ":
 			tvar int __t = __i
 			tvar lstr __v
 			until __file[__t-1] == "	":
