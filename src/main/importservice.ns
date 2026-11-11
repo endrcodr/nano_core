@@ -3,10 +3,13 @@ i\ npms_reader.ns
 
 class import(package):
     tvar lstr error
-    bool fs.exists(package,".ns")
-    bool2 fs.exists(package,"-injector.npms")
-    bool .out or .out2
-    if not bool.out:
+    if not fs.exists(package,"-injector.npms"):
         error = "packageNotFound"
         return error
-    
+    private list __vars = call(extract_npms({package,"-injector.npms"},"","names"))
+    private list __vals = call(extract_npms({package,"-injector.npms"},"","vals"))
+    sort(__vars,__vals)
+
+private class sort(vars,vals):
+    private list __variables = vars
+    private list __values = vals
