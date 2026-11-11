@@ -32,6 +32,7 @@ RT_SBBIN       equ 0x4000     ; ... and bin -> text in the builder
 RT_SBSAVE      equ 0x1000     ; keep the text builder across a call
 RT_DIV         equ 0x8000     ; a / b (FPU) and a % b, with the divide-by-zero check
 RT_FS          equ 0x10000    ; the fs. functions (file system)
+RT_MEM         equ 0x20000    ; the mem. functions (arena or raw addresses)
 
 section .bss
     out_buf    resb OUT_SIZE
@@ -44,6 +45,7 @@ section .bss
     lbl_len    resq 1
     w_aty      resb 1
     fs_nm      resb 32
+    w_nargs    resd 1               ; arguments of the call being written
 
 section .data
 ; (STR is defined in nlang_compiler.nasm, which includes this file)
@@ -58,6 +60,8 @@ STR s_sec_bss,  `section .bss\n`
 STR s_sec_data, `section .data\n`
 STR s_sec_text, `section .text\n`
 STR s_vpre,     `v_`
+STR s_vx,       `v`
+STR s_vus,      `_`
 STR s_resq,     `:  resq 1\n`
 STR s_dq,       `:  dq `
 STR s_db,       `    db `
@@ -185,6 +189,12 @@ STR s_pop_rax,   `    pop  rax\n`
 STR s_pop_rdx,   `    pop  rdx\n`
 STR s_pop_rcx,   `    pop  rcx\n`
 STR s_call_rt,   `    call rt_`
+STR s_pop_r8,    `    pop  r8\n`
+STR s_mov_rdx_rcx_m, `    mov  rdx, rcx\n`
+STR s_mem_equ,   `\nMEM_SIZE equ `
+STR s_mema_1, `\n; ---- mem. functions: the arena ----\n; Addresses are offsets into the arena (0 .. MEM_SIZE - 1).  An address outside it ends the program with 0x209.\n; get / set work on one byte; clear and copy on the bytes from the first address to the second, both included.\n; The functions keep rbx, rsi, rdi, rbp, r12-r15.\nsection .bss\nrt_arena: resb MEM_SIZE\nsection .text\n\nrt_mem_oob:\n    mov  ecx, 0x209\n    jmp  rt_die\n\nrt_mem_get:                     ; rcx = address -> rax = the byte (0 - 255)\n    cmp  rcx, MEM_SIZE\n    jae  rt_mem_oob\n    lea  rax, [rt_arena]\n    movzx eax, byte [rax + rcx]\n    ret\n\nrt_mem_set:                     ; rcx = address, rdx = value (its low 8 bits are stored)\n    cmp  rcx, MEM_SIZE\n    jae  rt_mem_oob\n    lea  rax, [rt_arena]\n    mov  [rax + rcx], dl\n    ret\n\nrt_mem_clear:                   ; rcx = first address, rdx = last address\n    cmp  rcx, rdx\n    ja   rt_mem_oob\n    cmp  rdx, MEM_SIZE\n    jae  rt_mem_oob\n    lea  r8, [rt_arena]\n    add  rcx, r8\n    add  rdx, r8\n.l: mov  byte [rcx], 0\n    inc  rcx\n    cmp  rcx, rdx\n    jbe  .l\n    ret\n\n`
+STR s_mema_2, `rt_mem_copy:                    ; rcx = first address, rdx = last address, r8 = where the first byte goes (overlap is fine)\n    cmp  rcx, rdx\n    ja   rt_mem_oob\n    cmp  rdx, MEM_SIZE\n    jae  rt_mem_oob\n    cmp  r8, MEM_SIZE\n    jae  rt_mem_oob\n    mov  rax, rdx\n    sub  rax, rcx               ; length - 1\n    lea  r9, [r8 + rax]\n    cmp  r9, MEM_SIZE           ; the last byte written must be inside too\n    jae  rt_mem_oob\n    lea  r10, [rt_arena]\n    add  rcx, r10\n    add  r8, r10\n    inc  rax                    ; length\n    cmp  r8, rcx\n    jbe  .fwd\n.bwd:\n    mov  dl, [rcx + rax - 1]\n    mov  [r8 + rax - 1], dl\n    dec  rax\n    jnz  .bwd\n    ret\n.fwd:\n    xor  r9d, r9d\n.f: mov  dl, [rcx + r9]\n    mov  [r8 + r9], dl\n    inc  r9\n    cmp  r9, rax\n    jb   .f\n    ret\n\n\n`
+STR s_memr_1, `\n; ---- mem. functions: raw addresses ([mem-mode ADVANCED]) ----\n; The addresses are real addresses of this program; NOTHING is checked.  A bad address crashes the program\n; (and a wrong write can damage the program's own variables).\nsection .text\n\nrt_mem_get:                     ; rcx = address -> rax = the byte\n    movzx eax, byte [rcx]\n    ret\n\nrt_mem_set:                     ; rcx = address, rdx = value (its low 8 bits are stored)\n    mov  [rcx], dl\n    ret\n\nrt_mem_clear:                   ; rcx = first address, rdx = last address\n    cmp  rcx, rdx\n    ja   .d\n.l: mov  byte [rcx], 0\n    inc  rcx\n    cmp  rcx, rdx\n    jbe  .l\n.d: ret\n\nrt_mem_copy:                    ; rcx = first address, rdx = last address, r8 = where the first byte goes (overlap is fine)\n    cmp  rcx, rdx\n    ja   .d\n    mov  rax, rdx\n    sub  rax, rcx\n    inc  rax                    ; length\n    cmp  r8, rcx\n    jbe  .fwd\n.bwd:\n    mov  dl, [rcx + rax - 1]\n    mov  [r8 + rax - 1], dl\n    dec  rax\n    jnz  .bwd\n    ret\n.fwd:\n    xor  r9d, r9d\n.f: mov  dl, [rcx + r9]\n    mov  [r8 + r9], dl\n    inc  r9\n    cmp  r9, rax\n    jb   .f\n.d: ret\n\n\n`
 STR s_fsc_1, `\n; ---- fs. functions (file system) ----\n; The ops take rcx = first argument, rdx = second (lstr addresses) and keep rbx, rsi, rdi, rbp, r12-r15.\n; A failed operation ends the program with 0x208.  Results that are text go to one of two buffers (they alternate).\nsection .bss\nrt_fsp1:  resb 4104\nrt_fsp2:  resb 4104\nrt_fsb1:  resb 4112\nrt_fsb2:  resb 4112\nrt_fsb:   resq 1\nrt_fst:   resq 3\nrt_fsw:   resq 16\nrt_fsck:  resb 8192\nrt_fsst:  resb 144\nsection .text\n\nrt_fs_fail:\n    mov  ecx, 0x208\n    jmp  rt_die\n\nrt_fs_cp:                       ; rcx = lstr, rdx = buffer: a NUL-terminated copy\n    mov  r8, [rcx]\n    cmp  r8, 4095\n    ja   rt_fs_fail\n    lea  r9, [rcx + 8]\n    xor  eax, eax\n.l: cmp  rax, r8\n    jae  .d\n    mov  r11b, [r9 + rax]\n    mov  [rdx + rax], r11b\n    inc  rax\n    jmp  .l\n.d: mov  byte [rdx + rax], 0\n    ret\n\nrt_fs_p1:                       ; rcx = lstr -> rt_fsp1\n    lea  rdx, [rt_fsp1]\n    jmp  rt_fs_cp\n\nrt_fs_p12:                      ; rcx, rdx = lstr -> rt_fsp1, rt_fsp2\n    push rdx\n    lea  rdx, [rt_fsp1]\n    call rt_fs_cp\n    pop  rcx\n    lea  rdx, [rt_fsp2]\n    jmp  rt_fs_cp\n\nrt_fs_nb:                       ; [rt_fsb] = the other result buffer\n    lea  rax, [rt_fsb1]\n    cmp  [rt_fsb], rax\n    jne  .a\n    lea  rax, [rt_fsb2]\n.a: mov  [rt_fsb], rax\n    ret\n\n`
 STR s_fsc_2, `rt_fs_wall:                     ; write rdx[0..r8) to the handle rcx, all of it\n    mov  [rt_fsw + 16], rcx\n    mov  [rt_fsw + 24], rdx\n    mov  [rt_fsw + 32], r8\n.l: cmp  qword [rt_fsw + 32], 0\n    jle  .d\n    mov  rcx, [rt_fsw + 16]\n    mov  rdx, [rt_fsw + 24]\n    mov  r8, [rt_fsw + 32]\n    call rt_sys_write\n    test rax, rax\n    jle  rt_fs_fail\n    add  [rt_fsw + 24], rax\n    sub  [rt_fsw + 32], rax\n    jmp  .l\n.d: ret\n\nrt_fs_copyp:                    ; copy the file rt_fsp1 to rt_fsp2 (replacing it)\n    lea  r8, [rt_fsp1]\n    lea  r9, [rt_fsp2]\n.eq:\n    mov  al, [r8]\n    cmp  al, [r9]\n    jne  .go\n    test al, al\n    jz   .ret                   ; the same path: nothing to do\n    inc  r8\n    inc  r9\n    jmp  .eq\n.go:\n    lea  rcx, [rt_fsp1]\n    call rt_sys_open_r\n    test rax, rax\n    js   rt_fs_fail\n    mov  [rt_fsw], rax\n    lea  rcx, [rt_fsp2]\n    xor  edx, edx\n    call rt_sys_open_w\n    test rax, rax\n    js   rt_fs_fail\n    mov  [rt_fsw + 8], rax\n.rd:\n    mov  rcx, [rt_fsw]\n    lea  rdx, [rt_fsck]\n    mov  r8d, 8192\n    call rt_sys_read\n    test rax, rax\n    js   rt_fs_fail\n    jz   .end\n    mov  r8, rax\n    mov  rcx, [rt_fsw + 8]\n    lea  rdx, [rt_fsck]\n    call rt_fs_wall\n    jmp  .rd\n.end:\n    mov  rcx, [rt_fsw]\n    call rt_sys_close\n    mov  rcx, [rt_fsw + 8]\n    call rt_sys_close\n.ret:\n    ret\n\n`
 STR s_fsc_3, `rt_fs_addname:                  ; rcx = a NUL-terminated name: appended to the result, after a newline\n    mov  r9, [rt_fsb]\n    mov  r8, [r9]\n    add  r9, 8\n    test r8, r8\n    jz   .nosep\n    cmp  r8, 4096\n    jae  .big\n    mov  byte [r9 + r8], 10\n    inc  r8\n.nosep:\n.c: mov  al, [rcx]\n    test al, al\n    jz   .done\n    cmp  r8, 4096\n    jae  .big\n    mov  [r9 + r8], al\n    inc  r8\n    inc  rcx\n    jmp  .c\n.done:\n    mov  r9, [rt_fsb]\n    mov  [r9], r8\n    ret\n.big:\n    mov  ecx, 0x203\n    jmp  rt_die\n\nrt_fs_exists:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_stat\n    test rax, rax\n    setnz al\n    movzx eax, al\n    ret\n\nrt_fs_isdir:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_stat\n    cmp  rax, 2\n    sete al\n    movzx eax, al\n    ret\n\nrt_fs_getsize:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_stat\n    test rax, rax\n    jz   rt_fs_fail\n    mov  rax, [rt_fst + 8]\n    ret\n\nrt_fs_gettime:\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    call rt_sys_stat\n    test rax, rax\n    jz   rt_fs_fail\n    mov  rax, [rt_fst + 16]\n    ret\n\nrt_fs_create:                   ; makes the file when it is missing, never changes an existing one\n    call rt_fs_p1\n    lea  rcx, [rt_fsp1]\n    mov  edx, 2\n    call rt_sys_open_w\n    test rax, rax\n    js   rt_fs_fail\n    mov  rcx, rax\n    jmp  rt_sys_close\n\n`
@@ -1081,8 +1091,23 @@ write_arg_push:
     mov  bx, ERR_TABLE_FULL
     jmp  error
 
-emit_param_label:               ; v_<name of parameter [w_idx] of [w_fn]>@<id>   (a class: just v_<name>)
+; EAX = file number: "v_" for the main script, "v<n>_" for an included file
+emit_vpre:
+    test eax, eax
+    jnz  .f
     EMIT s_vpre
+    ret
+.f: push rax
+    EMIT s_vx
+    pop  rax
+    call emit_dec
+    EMIT s_vus
+    ret
+
+emit_param_label:               ; v_<name of parameter [w_idx] of [w_fn]>@<id>   (a class: just v_<name>); the file of the function
+    mov  r9, [w_fn]
+    movzx eax, byte [r9 + 160]
+    call emit_vpre
     mov  r9, [w_fn]
     mov  eax, [w_idx]
     shl  eax, 4
@@ -1102,16 +1127,32 @@ emit_param_label:               ; v_<name of parameter [w_idx] of [w_fn]>@<id>  
 
 ; the call itself: arguments are on the stack (last on top)
 ; fs.xxx: the arguments are on the stack (the last one on top); the result comes back in rax
-write_fs_emit:
-    or   dword [rt_need], RT_FS
+write_fs_emit:                  ; (also the mem. functions: they are numbered from MEM_ID_BASE)
     mov  r8, [w_fn]
-    movzx eax, byte [r8 + 20]
-    cmp  eax, 2
+    mov  eax, RT_FS
+    cmp  dword [r8 + 16], MEM_ID_BASE
+    jb   .need
+    mov  eax, RT_MEM
+.need:
+    or   [rt_need], eax
+    cmp  dword [r8 + 16], MEM_ID_BASE + 3
+    jne  .normal
+    cmp  dword [w_nargs], 2     ; mem.copy src, dst: one byte (the range end is the start)
+    jne  .normal
+    EMIT s_pop_r8
+    EMIT s_pop_rcx
+    EMIT s_mov_rdx_rcx_m
+    jmp  .name
+.normal:
+    cmp  dword [w_nargs], 3
+    jb   .n2
+    EMIT s_pop_r8
+.n2:
+    cmp  dword [w_nargs], 2
     jb   .one
     EMIT s_pop_rdx
 .one:
-    mov  r8, [w_fn]
-    cmp  byte [r8 + 20], 0
+    cmp  dword [w_nargs], 0
     je   .name
     EMIT s_pop_rcx
 .name:
@@ -1250,6 +1291,20 @@ write_fs_rt:                    ; the runtime of the fs. functions: shared part,
     EMIT s_fsl_1
     EMIT s_fsl_2
     EMIT s_fsl_3
+    ret
+
+write_mem_rt:                   ; the runtime of the mem. functions: the arena (with its size) or raw addresses
+    cmp  byte [mem_raw], 0
+    jne  .raw
+    EMIT s_mem_equ
+    mov  eax, [mem_size]
+    call emit_dec
+    EMIT s_nl
+    EMIT s_mema_1
+    EMIT s_mema_2
+    ret
+.raw:
+    EMIT s_memr_1
     ret
 
 write_ca_scratch:               ; the scratch buffers of text arguments
@@ -1481,6 +1536,10 @@ out_end:                        ; footer, runtime helpers, then write the file
     jz   .nofs
     call write_fs_rt
 .nofs:
+    test dword [rt_need], RT_MEM
+    jz   .nomem
+    call write_mem_rt
+.nomem:
     ; fall through
 
 out_flush:
@@ -1583,7 +1642,8 @@ emit_label_ls:
 emit_label_p:
     mov  [lbl_ptr], rdx
     mov  [lbl_len], r8
-    EMIT s_vpre                 ; (clobbers RDX / R8)
+    movzx eax, byte [cur_file]  ; v_name  or, in an included file,  v<file>_name
+    call emit_vpre              ; (clobbers RDX / R8)
     mov  rdx, [lbl_ptr]
     mov  r8, [lbl_len]
     call emit_bytes

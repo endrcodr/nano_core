@@ -27,10 +27,16 @@ FN_LISTOP   equ 16              ; list.name.append / insert / remove / clear / s
 FN_ASSIGN   equ 17              ; x = expr / x += expr / x -= expr / name(args)
 FN_RET      equ 18              ; ret [value]
 FN_CLASS    equ 19              ; class name:
+FN_PRIVATE  equ 20              ; private var / tvar / list / class / def (replaced by the word after it)
+INC_POOL    equ 4194304         ; room for the text of all included files
+INC_DEPTH   equ 8               ; i\ inside i\ ... this deep
+INC_FILES   equ 63              ; included files per program
 FN_MAX      equ 64              ; functions per program
 FS_ID_BASE  equ 0x1000          ; function ids from here on are the built-in fs. functions
-FS_COUNT    equ 16
-FN_SIZE     equ 160             ; bytes per function record (see "functions" below)
+MEM_ID_BASE equ 0x1100          ; ... and from here on the mem. functions (get, set, clear, copy)
+BI_COUNT    equ 20              ; built-in functions: 16 fs. + 4 mem.
+MEM_MAX     equ 0x10000000      ; largest arena (mem.size)
+FN_SIZE     equ 168             ; bytes per function record (see "functions" below)
 MAX_PARAMS  equ 8
 CA_MAX      equ 128             ; text (lstr) arguments in the whole program
 BIN_BYTES   equ 4096            ; bytes of bits a bin can hold (BIN_BYTES in the generated code)
@@ -107,7 +113,14 @@ ERR_BIN_TOO_BIG        equ 31   ; bin literal longer than BIN_BITS
 ERR_BIN_LOCAL          equ 32   ; bin variable inside a def
 ERR_CLASS_CALL        equ 33   ; a class is run with call(name), a def with name(args)
 ERR_FS_UNKNOWN         equ 34   ; fs.name is not an fs. function (or is not available yet)
-ERR_COUNT              equ 30   ; number of messages in err_msgs (codes 5..34)
+ERR_MEM_SIZE           equ 35   ; mem.size: not a number 1..MEM_MAX, used twice, after another mem. function, or in raw mode
+ERR_MEM_MODE           equ 36   ; [mem-mode ...] is wrong or is not alone on the first line
+ERR_IMPORT             equ 37   ; i\ : no path, not ending in .ns, not on a line of its own, or inside a block
+ERR_IMPORT_READ        equ 38   ; the included file can't be read (or is bigger than the space for included files)
+ERR_IMPORT_LIMIT       equ 39   ; too many included files or includes nested too deep
+ERR_PRIVATE            equ 40   ; private is not followed by var, tvar, list, class or def
+ERR_CLASS_CLASH        equ 41   ; a public class with this name exists in another file
+ERR_COUNT              equ 37   ; number of messages in err_msgs (codes 5..41)
 
 VAR_TABLE_SIZE equ 0x10000
 
@@ -224,6 +237,28 @@ section .bss
     fn_ids      resd 1              ; functions seen so far: their number is used in the labels
     fn_count    resd 1
     call_ctr    resd 1              ; call sites so far
+    mem_raw     resb 1              ; [mem-mode ADVANCED] on the first line: mem. uses real addresses
+    mem_used    resb 1              ; a mem. function has been used
+    mem_sized   resb 1              ; mem.size has been used
+    mem_size    resd 1              ; bytes of the arena
+    cur_file    resb 1              ; 0 = the main script, 1.. = the included file being compiled
+    file_cnt    resb 1              ; included files so far
+    priv_flag   resb 1              ; the statement being compiled started with private
+    fc_pub      resb 1
+    decl_pub    resb 1
+    ff_pass     resb 1
+    inc_depth   resd 1
+    cur_base    resq 1              ; text of the file being compiled: [cur_base, cur_end)
+    cur_end     resq 1
+    inc_top     resq 1              ; next free byte of inc_pool
+    imp_ptr     resq 1
+    imp_len     resq 1
+    imp_bytes   resq 1
+    imp_rem     resq 1
+    inc_tab     resb 16 * (INC_FILES + 1)   ; per file: path pointer, path length (0 = the main script)
+    inc_stack   resb 64 * INC_DEPTH         ; saved: +0 rsi +8 r12 +16 cur_base +24 cur_end +32 cur_file +33 is_ns
+    fv_key      resb 264
+    inc_pool    resb INC_POOL
     call_np     resb 1              ; the next parse_call reads its arguments without parentheses (fs.write a, b)
     w_id        resd 1
     w_site      resd 1
@@ -261,6 +296,7 @@ kw_table:
     KW "ret",    FN_RET
     KW "class",  FN_CLASS
     KW "import", FN_IMPORT
+    KW "private", FN_PRIVATE
     db 0
 ; "mem." and "fs." families are matched by prefix in match_keyword.
 
@@ -268,14 +304,15 @@ zero_char: db '0'               ; default value of an uninitialised str / lstr
 
 ; ---- the fs. functions: records like the ones of a def (see "functions"), parameters and result are text / numbers ----
 %assign FS_I 0
-%macro FSREC 5              ; name, id, number of parameters, result type (0xFE: none), type of every parameter
+%macro FSREC 6              ; name, id, number of parameters, result type (0xFE: none), type of every parameter, flags (+31)
+;   flags: 1 = ':' may follow the first argument   2 = ... and the comma may not   4 = the 2nd argument can be left out (no ':')   8 = '=' may follow the first argument
     dq fs_names + 12 * FS_I
     dq %strlen(%1)
     dd %2
     db %3, %4
     times 8 db %5
-    db 0, 0
-    times 128 db 0
+    db 0, %6
+    times 136 db 0
 %assign FS_I FS_I + 1
 %endmacro
 %macro FSNM 1
@@ -299,23 +336,31 @@ fs_names:
     FSNM "fs.getdir"
     FSNM "fs.getsize"
     FSNM "fs.gettime"
+    FSNM "mem.get"
+    FSNM "mem.set"
+    FSNM "mem.clear"
+    FSNM "mem.copy"
 fs_table:
-    FSREC "fs.create", FS_ID_BASE + 0, 1, 254, 2
-    FSREC "fs.delete", FS_ID_BASE + 1, 1, 254, 2
-    FSREC "fs.move", FS_ID_BASE + 2, 2, 254, 2
-    FSREC "fs.copy", FS_ID_BASE + 3, 2, 254, 2
-    FSREC "fs.rename", FS_ID_BASE + 4, 2, 254, 2
-    FSREC "fs.read", FS_ID_BASE + 5, 1, 2, 2
-    FSREC "fs.write", FS_ID_BASE + 6, 2, 254, 2
-    FSREC "fs.append", FS_ID_BASE + 7, 2, 254, 2
-    FSREC "fs.list", FS_ID_BASE + 8, 1, 2, 2
-    FSREC "fs.exists", FS_ID_BASE + 9, 1, 0, 2
-    FSREC "fs.isdir", FS_ID_BASE + 10, 1, 0, 2
-    FSREC "fs.mkdir", FS_ID_BASE + 11, 1, 254, 2
-    FSREC "fs.rmdir", FS_ID_BASE + 12, 1, 254, 2
-    FSREC "fs.getdir", FS_ID_BASE + 13, 0, 2, 2
-    FSREC "fs.getsize", FS_ID_BASE + 14, 1, 0, 2
-    FSREC "fs.gettime", FS_ID_BASE + 15, 1, 0, 2
+    FSREC "fs.create", FS_ID_BASE + 0, 1, 254, 2, 0
+    FSREC "fs.delete", FS_ID_BASE + 1, 1, 254, 2, 0
+    FSREC "fs.move", FS_ID_BASE + 2, 2, 254, 2, 0
+    FSREC "fs.copy", FS_ID_BASE + 3, 2, 254, 2, 0
+    FSREC "fs.rename", FS_ID_BASE + 4, 2, 254, 2, 0
+    FSREC "fs.read", FS_ID_BASE + 5, 1, 2, 2, 0
+    FSREC "fs.write", FS_ID_BASE + 6, 2, 254, 2, 0
+    FSREC "fs.append", FS_ID_BASE + 7, 2, 254, 2, 0
+    FSREC "fs.list", FS_ID_BASE + 8, 1, 2, 2, 0
+    FSREC "fs.exists", FS_ID_BASE + 9, 1, 0, 2, 0
+    FSREC "fs.isdir", FS_ID_BASE + 10, 1, 0, 2, 0
+    FSREC "fs.mkdir", FS_ID_BASE + 11, 1, 254, 2, 0
+    FSREC "fs.rmdir", FS_ID_BASE + 12, 1, 254, 2, 0
+    FSREC "fs.getdir", FS_ID_BASE + 13, 0, 2, 2, 0
+    FSREC "fs.getsize", FS_ID_BASE + 14, 1, 0, 2, 0
+    FSREC "fs.gettime", FS_ID_BASE + 15, 1, 0, 2, 0
+    FSREC "mem.get", MEM_ID_BASE + 0, 1, 0, 0, 0
+    FSREC "mem.set", MEM_ID_BASE + 1, 2, 254, 0, 8
+    FSREC "mem.clear", MEM_ID_BASE + 2, 2, 254, 0, 3
+    FSREC "mem.copy", MEM_ID_BASE + 3, 3, 254, 0, 5
 
 ; STR name, text  ->  name: db text   /   name_len equ <length>      (also used by the writer)
 %macro STR 2
@@ -359,10 +404,19 @@ err_msgs:
     MSG "binary literal is longer than 32768 bits"              ; 31
     MSG "bin variables can only be declared outside a def (they can still be used inside one)" ; 32
     MSG "a class is run with call(name); a def is called as name(args)" ; 33
-    MSG "unknown fs. function (zip, unzip, secure, unsecure and the permission / owner functions are not available yet)" ; 34
+    MSG "unknown fs. / mem. function (fs.zip, unzip, secure, unsecure and the permission / owner functions are not available yet)" ; 34
+    MSG "mem.size needs one number from 1 to 268435456, once, before any other mem. function (and not with [mem-mode ADVANCED])" ; 35
+    MSG "unknown [mem-mode]: the only one is [mem-mode ADVANCED], alone on the very first line" ; 36
+    MSG "i\ needs a path ending in .ns, on a line of its own outside any block" ; 37
+    MSG "cannot read the included .ns file (missing, or bigger than the space left for included files)" ; 38
+    MSG "too many included files (63), or includes nested more than 8 deep" ; 39
+    MSG "private goes in front of var, tvar, list, class or def" ; 40
+    MSG "a public class with this name is already defined in another file (use private or another name)" ; 41
 
 STR s_msg_err,  "nlang: error 0x"
 STR s_msg_line, " (line "
+STR s_msg_in,   " (in "
+STR s_msg_cl,   ", line "
 STR s_msg_end,  "): "
 STR s_msg_nl,   `\n`
 STR s_msg_wrote, "nlang: wrote "
@@ -370,6 +424,7 @@ STR s_msg_comp,  "nlang: compiling "
 STR s_msg_open,  " ("
 STR s_msg_bytes, " bytes"
 STR s_msg_pkg,   ", package file"
+STR s_msg_adv,   ", [mem-mode ADVANCED]: mem. uses real addresses, unchecked"
 STR s_msg_close, `)\n`
 STR s_msg_done,  "nlang: done - "
 STR s_msg_stmts, " statements"
@@ -412,8 +467,19 @@ section .text
 ; class @@@: - Defines a block of code that does not run by itself: it only runs when something calls it with call(@@@). A class takes no arguments and returns no value; the variables declared in it are global.
 ; call(@@@) - Runs the class named @@@. Only classes are run this way (functions are called as name(args)).
 ; def @@@ (args): - Defines a function. The name is represented here as '@@@', and arguments, however many are needed, are represented as 'args'. The function is called by using the name of the function, and passing in the arguments. The function can return a value, which can be used in the code.
+; (WORKING, in this form:  i\ lib/util.ns   or   import lib/util.ns   on a line of its own outside any block.  The raw text of the .ns file is
+;  compiled at that place; the path is looked up next to the file with the i\ line; a file is included once; only .ns files.
+;  Names are per file: the variables, lists and defs of an included file belong to it alone (labels v<file>_name); only its public classes
+;  are shared, a class marked  private  is not.  private goes in front of var, tvar, list, class and def.  Defs only run when called.)
 ; import @@@ - Imports the compiled code of another file to this location in this file. The name of the file is represented here as '@@@', and the file must be in the same directory as this file, in the defined directory, in the system's PATH, or from locations such as GitHub using its URL, then its file location. This allows projects built on a GitHub repository to be compiled and run without needing to manually download the new files, replace the file in the directory, and recompile the code, as opposed to simply recompiling the code.
 ; mem. functions - Functions that allow the user to manipulate memory, such as copying, moving, and deleting data. These functions are as follows:
+; (WORKING.  Addresses are offsets into an arena of the program (1 MiB; mem.size N before the first mem. function changes that, up to
+;  268435456); an address outside it ends the program with 0x209.  A byte at a time: mem.get gives 0 - 255, mem.set stores the low 8 bits.
+;  clear and copy take the bytes from the first address to the last one, both included; copy may overlap.
+;  Statements:  mem.set 0x10 = 65    mem.clear 0x10:0x1F    mem.copy 0x10:0x1F, 0x40    mem.copy 0x10, 0x40 (one byte)
+;  Values need parentheses:  var num b = mem.get(0x10).   Addresses are number expressions.
+;  If the very first line of the file is  [mem-mode ADVANCED]  the addresses are the real addresses of the running program and nothing
+;  is checked (mem.size is then an error).  A program without any mem. function has no arena at all.)
 ; mem.get 0xXXXXX - Gets the value of the memory address, represented here as '0xXXXXX', and returns it. Used when defining a variable's value.
 ; mem.set 0xXXXXX = * - Sets the value of the memory address, represented here as '0xXXXXX', to a value, represented here as '*'.
 ; mem.clear 0xXXXXX:0xYYYYY - Clears the memory from the address represented here as '0xXXXXX' to the address represented here as '0xYYYYY'.
@@ -467,6 +533,25 @@ compile:
     lea  rsi, [buffer]
     mov  r12, [bytes_read]
     add  r12, rsi
+    mov  [cur_base], rsi
+    mov  [cur_end], r12
+    mov  byte [cur_file], 0
+    mov  byte [file_cnt], 0
+    mov  byte [priv_flag], 0
+    mov  dword [inc_depth], 0
+    lea  rax, [inc_pool]
+    mov  [inc_top], rax
+    lea  rdx, [path_buf]        ; file 0 is the script itself (i\ looks next to it)
+    xor  ecx, ecx
+.pth_l:
+    cmp  byte [rdx + rcx], 0
+    je   .pth_d
+    inc  ecx
+    jmp  .pth_l
+.pth_d:
+    lea  rax, [inc_tab]
+    mov  [rax], rdx
+    mov  [rax + 8], rcx
     lea  r15, [var_table]
     xor  r13d, r13d
     xor  r14d, r14d
@@ -495,6 +580,7 @@ compile:
     inc  rcx
     jmp  .nul_scan
 .text_ok:
+    call mem_mode_scan          ; [mem-mode ADVANCED] on the first line
     call print_start            ; "nlang: compiling <file> (N bytes)"
     call out_begin              ; NASM header
 
@@ -522,6 +608,19 @@ compile:
     call ident_char             ; eax = 1 if this starts a token
     test eax, eax
     jnz  .token
+    cmp  byte [rsi], '['        ; [mem-mode ...] anywhere but the first line is a mistake, not a comment
+    jne  .next_char
+    lea  rcx, [rsi + 9]
+    cmp  rcx, r12
+    ja   .next_char
+    cmp  dword [rsi], '[mem'
+    jne  .next_char
+    cmp  dword [rsi + 4], '-mod'
+    jne  .next_char
+    cmp  byte [rsi + 8], 'e'
+    jne  .next_char
+    mov  bx, ERR_MEM_MODE
+    jmp  error
     ; Operators, quotes, brackets...: not handled yet (TODO), just skip them.
 
 .next_char:
@@ -534,6 +633,7 @@ compile:
     call write_current_func     ; the statement ended: hand it to the writer
 .nl_done:
     xor  r14d, r14d             ; a statement ends at the end of its line
+    mov  byte [priv_flag], 0
     jmp  .next_char
 
 ; ---- comments ---------------------------------------------------------------
@@ -605,6 +705,16 @@ compile:
     mov  [tk_ptr], rdi
     mov  [tk_len], rcx
     call match_keyword
+    test eax, eax
+    jnz  .kw_have
+    cmp  rcx, 1                 ; i\ path.ns  is import
+    jne  .kw_have
+    cmp  byte [rdi], 'i'
+    jne  .kw_have
+    cmp  byte [rsi], '\'
+    jne  .kw_have
+    mov  eax, FN_IMPORT
+.kw_have:
     mov  [bl_kw], eax
     call line_indent            ; EAX = indentation, or -1 when something else precedes it on the line
     cmp  eax, -1
@@ -635,6 +745,37 @@ compile:
     mov  eax, [bl_kw]
     test eax, eax
     jz   .as_variable
+    cmp  eax, FN_PRIVATE
+    jne  .not_priv
+    cmp  byte [bl_first], 0     ; only at the start of a line; elsewhere it is just a name
+    je   .as_variable
+    mov  byte [priv_flag], 1    ; private var / tvar / list / class / def: look at the word after it
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .err_private
+    call read_ident
+    test rcx, rcx
+    jz   .err_private
+    push qword [tk_ptr]
+    push qword [tk_len]
+    mov  [tk_ptr], rdi
+    mov  [tk_len], rcx
+    call match_keyword
+    pop  qword [tk_len]
+    pop  qword [tk_ptr]
+    cmp  eax, FN_VAR
+    je   .priv_ok
+    cmp  eax, FN_TVAR
+    je   .priv_ok
+    cmp  eax, FN_LISTDECL
+    je   .priv_ok
+    cmp  eax, FN_CLASS
+    je   .priv_ok
+    cmp  eax, FN_DEF
+    jne  .err_private
+.priv_ok:
+    mov  [bl_kw], eax
+.not_priv:
     mov  r14d, eax
     call note_stmt              ; count it (and show it with -v)
     mov  eax, r14d
@@ -666,7 +807,11 @@ compile:
     je   .class_stmt
     cmp  eax, FN_RET
     je   .ret_stmt
+    cmp  eax, FN_IMPORT
+    je   .import_stmt
     cmp  eax, FN_FS
+    je   .fs_stmt
+    cmp  eax, FN_MEM
     je   .fs_stmt
     jmp  .func_logic
 .opaque:
@@ -904,10 +1049,18 @@ compile:
 
 ; ---- fs.name args   or   fs.name(args)   as a statement ------------------------------------
 .fs_stmt:                       ; RDI / RCX = the token, RSI just past it
+    cmp  rcx, 8
+    jne  .not_msize
+    cmp  dword [rdi], 'mem.'
+    jne  .not_msize
+    cmp  dword [rdi + 4], 'size'
+    je   .mem_size              ; mem.size N: a directive, nothing is generated
+.not_msize:
     call fs_find
     test rax, rax
     jz   .err_fs_unknown
     mov  [call_fn], rax
+    call note_builtin
     call skip_blanks
     mov  byte [call_np], 1
     cmp  rsi, r12
@@ -923,6 +1076,224 @@ compile:
     jmp  .stmt_done
 .err_fs_unknown:
     mov  bx, ERR_FS_UNKNOWN
+    jmp  error
+.err_private:
+    mov  bx, ERR_PRIVATE
+    jmp  error
+.err_import:
+    mov  bx, ERR_IMPORT
+    jmp  error
+.err_import_read:
+    mov  bx, ERR_IMPORT_READ
+    jmp  error
+.err_import_limit:
+    mov  bx, ERR_IMPORT_LIMIT
+    jmp  error
+
+; ---- i\ path.ns   (or  import path.ns) ----------------------------------------------------------------------
+; The text of the .ns file is compiled right here, as if it were typed in at this place.  The path is looked up next to the file
+; that contains the i\ line, and a file is included only once.  Inside the included file the variables, lists and defs
+; are the file's own (the generated labels are v<file>_name); only its public classes can be used from the other files.
+.import_stmt:
+    cmp  byte [bl_first], 0
+    je   .err_import
+    cmp  dword [blk_depth], 0
+    jne  .err_import
+    cmp  rcx, 1                 ; the token was "i": the backslash is next
+    jne  .imp_path
+    inc  rsi
+.imp_path:
+    call skip_blanks
+    mov  rdi, rsi               ; the path runs to the end of the line (or a # comment)
+.imp_e:
+    cmp  rsi, r12
+    jae  .imp_end
+    mov  al, [rsi]
+    cmp  al, 0x0A
+    je   .imp_end
+    cmp  al, 0x0D
+    je   .imp_end
+    cmp  al, '#'
+    je   .imp_end
+    inc  rsi
+    jmp  .imp_e
+.imp_end:
+    mov  rcx, rsi               ; (RSI stays at the end of the path: the rest of the line is the importing file's)
+.imp_trim:
+    cmp  rcx, rdi
+    jbe  .imp_trimmed
+    mov  al, [rcx - 1]
+    cmp  al, ' '
+    je   .imp_t1
+    cmp  al, 0x09
+    jne  .imp_trimmed
+.imp_t1:
+    dec  rcx
+    jmp  .imp_trim
+.imp_trimmed:
+    sub  rcx, rdi               ; length of the path
+    cmp  rcx, 4
+    jb   .err_import
+    cmp  rcx, 1000
+    ja   .err_import
+    cmp  byte [rdi + rcx - 3], '.'
+    jne  .err_import
+    cmp  byte [rdi + rcx - 2], 'n'
+    jne  .err_import
+    cmp  byte [rdi + rcx - 1], 's'
+    jne  .err_import
+    call import_join            ; RAX = the full path (NUL-terminated, at inc_top), RCX = its length
+    mov  [imp_ptr], rax
+    mov  [imp_len], rcx
+    movzx r8d, byte [file_cnt]  ; already included?  then there is nothing to do
+    mov  r9d, 1
+.imp_dup:
+    cmp  r9d, r8d
+    ja   .imp_new
+    mov  eax, r9d
+    shl  eax, 4
+    lea  rdx, [inc_tab]
+    cmp  [rdx + rax + 8], rcx
+    jne  .imp_dn
+    mov  r10, [rdx + rax]
+    mov  rdi, [imp_ptr]
+    xor  r11d, r11d
+.imp_dc:
+    mov  al, [r10 + r11]
+    cmp  al, [rdi + r11]
+    jne  .imp_dn
+    inc  r11
+    cmp  r11, rcx
+    jb   .imp_dc
+    jmp  .imp_done              ; the same file again
+.imp_dn:
+    inc  r9d
+    jmp  .imp_dup
+.imp_new:
+    cmp  byte [file_cnt], INC_FILES
+    jae  .err_import_limit
+    cmp  dword [inc_depth], INC_DEPTH
+    jae  .err_import_limit
+    inc  byte [file_cnt]
+    movzx eax, byte [file_cnt]
+    shl  eax, 4
+    lea  rdx, [inc_tab]
+    mov  r8, [imp_ptr]
+    mov  [rdx + rax], r8
+    mov  [rdx + rax + 8], rcx
+    lea  r8, [r8 + rcx + 16]    ; the text goes after the path, 16-byte aligned
+    and  r8, -16
+    mov  [inc_top], r8
+    lea  rax, [inc_pool + INC_POOL]
+    sub  rax, r8
+    jbe  .err_import_read
+    mov  [imp_rem], rax
+    mov  rcx, [imp_ptr]         ; os_read_file( path, buffer, size )
+    mov  rdx, r8
+    mov  r8, rax
+    call os_read_file
+    cmp  rax, -1
+    je   .err_import_read
+    cmp  rax, [imp_rem]         ; as big as the space: it may have been cut off
+    jae  .err_import_read
+    mov  [imp_bytes], rax
+    mov  rdx, [inc_top]
+    cmp  rax, 2                 ; the same text checks as for the main file
+    jb   .imp_nobom
+    movzx ecx, word [rdx]
+    cmp  cx, 0xFEFF
+    je   .imp_utf16
+    cmp  cx, 0xFFFE
+    je   .imp_utf16
+.imp_nobom:
+    xor  ecx, ecx
+.imp_nul:
+    cmp  rcx, [imp_bytes]
+    jae  .imp_push
+    cmp  byte [rdx + rcx], 0
+    je   .imp_utf16
+    inc  rcx
+    jmp  .imp_nul
+.imp_utf16:
+    mov  bx, ERR_UTF16
+    jmp  error
+.imp_push:
+    mov  eax, [inc_depth]       ; remember where to go on when the included text is done
+    imul eax, eax, 64
+    lea  rdx, [inc_stack]
+    add  rdx, rax
+    mov  [rdx], rsi
+    mov  [rdx + 8], r12
+    mov  rax, [cur_base]
+    mov  [rdx + 16], rax
+    mov  rax, [cur_end]
+    mov  [rdx + 24], rax
+    mov  al, [cur_file]
+    mov  [rdx + 32], al
+    mov  al, [is_ns]
+    mov  [rdx + 33], al
+    inc  dword [inc_depth]
+    mov  rsi, [inc_top]
+    mov  r12, rsi
+    add  r12, [imp_bytes]
+    mov  [cur_base], rsi
+    mov  [cur_end], r12
+    mov  al, [file_cnt]
+    mov  [cur_file], al
+    mov  byte [is_ns], 1        ; included files are .ns files: names starting with __ are allowed there
+    lea  rax, [r12 + 16]
+    and  rax, -16
+    mov  [inc_top], rax
+    mov  dword [cur_indent], 0
+.imp_done:
+    xor  r14d, r14d
+    jmp  .func_logic
+.inc_return:                    ; the end of an included file: back to the line after the import
+    dec  dword [inc_depth]
+    mov  eax, [inc_depth]
+    imul eax, eax, 64
+    lea  rdx, [inc_stack]
+    add  rdx, rax
+    mov  rsi, [rdx]
+    mov  r12, [rdx + 8]
+    mov  rax, [rdx + 16]
+    mov  [cur_base], rax
+    mov  rax, [rdx + 24]
+    mov  [cur_end], rax
+    mov  al, [rdx + 32]
+    mov  [cur_file], al
+    mov  al, [rdx + 33]
+    mov  [is_ns], al
+    xor  r14d, r14d
+    xor  r13d, r13d
+    mov  dword [cur_indent], 0
+    mov  byte [priv_flag], 0
+    jmp  .func_logic
+.mem_size:                      ; mem.size N : the arena has N bytes (1 .. MEM_MAX); once, before any other mem. function
+    cmp  byte [mem_used], 0
+    jne  .err_mem_size
+    cmp  byte [mem_sized], 0
+    jne  .err_mem_size
+    cmp  byte [mem_raw], 0
+    jne  .err_mem_size
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .err_mem_size
+    mov  al, [rsi]
+    sub  al, '0'
+    cmp  al, 9
+    ja   .err_mem_size          ; (a sign or a name is not a size)
+    call parse_number
+    test rax, rax
+    jz   .err_mem_size
+    cmp  rax, MEM_MAX
+    ja   .err_mem_size
+    mov  [mem_size], eax
+    mov  byte [mem_sized], 1
+    call expect_end
+    jmp  .stmt_done
+.err_mem_size:
+    mov  bx, ERR_MEM_SIZE
     jmp  error
 
 ; ---- a call as a statement: name(args) ---------------------------------------------
@@ -1040,6 +1411,8 @@ compile:
     call write_current_func     ; last statement had no trailing newline
 .close_blocks:
     call close_all_blocks       ; end of file ends every open block
+    cmp  dword [inc_depth], 0
+    jne  .inc_return            ; the end of an included file, not of the program
 .finish:
     call purge_tvars            ; temporaries die with the script
     call out_end                ; footer, then write <input>.nasm
@@ -1093,7 +1466,20 @@ print_error:
     je   .no_line
     cmp  eax, 0x100 + ERR_UTF16
     je   .no_line
+    cmp  byte [cur_file], 0
+    je   .main_line
+    PUT  s_msg_in               ; "(in lib/x.ns, line 3)"
+    movzx eax, byte [cur_file]
+    shl  eax, 4
+    lea  rdx, [inc_tab]
+    mov  rcx, [rdx + rax + 8]
+    mov  rdx, [rdx + rax]
+    call put_text
+    PUT  s_msg_cl
+    jmp  .line_no
+.main_line:
     PUT  s_msg_line
+.line_no:
     call count_line
     call put_dec
     PUT  s_msg_end
@@ -1174,6 +1560,10 @@ print_start:
     je   .close
     PUT  s_msg_pkg
 .close:
+    cmp  byte [mem_raw], 0
+    je   .noadv
+    PUT  s_msg_adv
+.noadv:
     PUT  s_msg_close
     jmp  flush_stdout
 
@@ -1234,6 +1624,10 @@ note_stmt:
     je   .compiled
     cmp  r14d, FN_FS
     je   .compiled
+    cmp  r14d, FN_IMPORT
+    je   .compiled
+    cmp  r14d, FN_MEM
+    je   .compiled
     inc  dword [skip_count]
     mov  byte [ns_flag], 1
 .compiled:
@@ -1249,7 +1643,7 @@ note_stmt:
     call count_line                      ; EAX = line number of RSI
     call put_dec
     PUT  s_msg_rb
-    lea  rbx, [buffer]
+    mov  rbx, [cur_base]
     mov  rdx, rdi
 .back:                                   ; start of this line
     cmp  rdx, rbx
@@ -1354,9 +1748,8 @@ put_hex3:                       ; low 12 bits of EAX as 3 hex digits
 
 ; line of the source RSI points into (1-based), capped at the end of the input
 count_line:
-    lea  rdx, [buffer]
-    mov  r8, [bytes_read]
-    add  r8, rdx
+    mov  rdx, [cur_base]
+    mov  r8, [cur_end]
     mov  r9, rsi
     cmp  r9, r8
     jbe  .go
@@ -1450,7 +1843,29 @@ match_keyword:
 ; clobbers RDX, R8-R11. Compares the whole name (the old code compared only the
 ; first character, did `movzx r8, ah`-style tricks that left dirty upper bits,
 ; and never finished the "found" path).
-find_var:
+find_var:                       ; in an included file the stored name is  <file number><name>  : the variables of each file are its own
+    cmp  byte [cur_file], 0
+    je   find_var_raw
+    test rcx, rcx
+    jz   find_var_raw
+    push rdi
+    push rcx
+    lea  r8, [fv_key]
+    mov  al, [cur_file]
+    mov  [r8], al
+    xor  r9d, r9d
+.k: mov  al, [rdi + r9]
+    mov  [r8 + 1 + r9], al
+    inc  r9
+    cmp  r9, rcx
+    jb   .k
+    lea  rdi, [fv_key]
+    inc  rcx
+    call find_var_raw
+    pop  rcx
+    pop  rdi
+    ret
+find_var_raw:
     movzx r8d, byte [r15]       ; number of variables
     lea  rdx, [r15 + 1]
 .next:
@@ -1932,8 +2347,9 @@ read_new_name:
 .fn_chk:
     mov  rdi, [vd_name]
     mov  rcx, [vd_len]
-    call fn_find
-    test rax, rax
+    xor  eax, eax
+    call fn_clash               ; only a function of THIS file takes the name (the class clash is checked by the class header)
+    test eax, eax
     jnz  .redeclared
     ret
 .syntax:
@@ -2503,26 +2919,40 @@ add_var:
     cmp  eax, 255
     jae  .full
     mov  r8, [vd_len]
-    lea  r9, [rdx + r8 + 10]
+    lea  r9, [rdx + r8 + 11]
     lea  rax, [r15 + VAR_TABLE_SIZE]
     cmp  r9, rax
     ja   .full
-    mov  [rdx], r8b
+    xor  ecx, ecx               ; 1 when the name carries the number of its file
+    cmp  byte [cur_file], 0
+    je   .nopre
+    cmp  r8, 255
+    jae  .full
+    mov  ecx, 1
+.nopre:
+    lea  rax, [r8 + rcx]
+    mov  [rdx], al
     movzx eax, byte [vd_type]
     cmp  byte [vd_temp], 0
     je   .typed
     or   al, VAR_TEMP
 .typed:
     mov  [rdx + 1], al
+    test ecx, ecx
+    jz   .nofile
+    mov  al, [cur_file]
+    mov  [rdx + 2], al
+.nofile:
     mov  r9, [vd_name]
     xor  r10d, r10d
+    lea  rax, [rdx + rcx]
 .nc:
     mov  r11b, [r9 + r10]
-    mov  [rdx + 2 + r10], r11b
+    mov  [rax + 2 + r10], r11b
     inc  r10
     cmp  r10, r8
     jb   .nc
-    lea  rdx, [rdx + 2 + r8]
+    lea  rdx, [rax + 2 + r8]
     xor  eax, eax
     cmp  byte [vd_type], 2
     je   .val
@@ -2645,7 +3075,7 @@ close_all_blocks:
 ; out: EAX = indentation of its line (space = 1, tab = to the next multiple of 4), or -1 if anything
 ;      other than blanks comes before the token on its line. Clobbers RCX, RDX, R8, R9.
 line_indent:
-    lea  rdx, [buffer]
+    mov  rdx, [cur_base]
     mov  r8, rdi
 .back:
     cmp  r8, rdx
@@ -2740,7 +3170,8 @@ blocks_line_start:
 
 ; ---- functions ------------------------------------------------------------------------
 ;   def name (num a, str b, lstr c):      ...body...       ret [value]          name(args)
-; Function record (FN_SIZE bytes):  +0 name ptr  +8 name length  +16 id  +20 parameter count
+; Function record (FN_SIZE bytes):  +160 file (0 = the main script, 1.. = included)  +161 private (1 = only usable in its file)
+;   +0 name ptr  +8 name length  +16 id  +20 parameter count
 ;   +21 return type (0 num, 1 str, 2 lstr, 0xFE nothing, 0xFF not known yet)  +22 parameter types (8)
 ;   +32 parameter names: 8 x (ptr, length)
 ; Parameters and everything declared in the body are local: they get their own storage (labels end in
@@ -2748,14 +3179,28 @@ blocks_line_start:
 ; call in a save area and restores it afterwards, so every call starts with its own variables.
 
 ; in: RDI = name, RCX = length   out: RAX = record or 0   clobbers RDX, R8-R10
-fn_find:
+fn_find:                        ; a function of this file first, then the public classes of the other files
+    mov  byte [ff_pass], 0
+.pass:
     mov  r8d, [fn_count]
     lea  rdx, [fn_table]
 .next:
     test r8d, r8d
-    jz   .none
+    jz   .endpass
     cmp  [rdx + 8], rcx
     jne  .skip
+    cmp  byte [ff_pass], 0
+    jne  .other
+    mov  al, [cur_file]
+    cmp  al, [rdx + 160]
+    jne  .skip
+    jmp  .named
+.other:
+    cmp  byte [rdx + 30], 0
+    je   .skip
+    cmp  byte [rdx + 161], 0
+    jne  .skip
+.named:
     mov  r9, [rdx]
     xor  r10d, r10d
 .cmp:
@@ -2771,6 +3216,11 @@ fn_find:
     add  rdx, FN_SIZE
     dec  r8d
     jmp  .next
+.endpass:
+    cmp  byte [ff_pass], 0
+    jne  .none
+    mov  byte [ff_pass], 1
+    jmp  .pass
 .none:
     xor  eax, eax
     ret
@@ -2924,6 +3374,7 @@ parse_param_list:
 
 ; def NAME (type a, type b):     RSI is just past "def"
 parse_def_header:
+    mov  byte [decl_pub], 0     ; a def is the file's own: only a function of this file can clash
     call read_new_name          ; checks the name against variables (vd_name / vd_len)
     mov  rdi, [vd_name]
     mov  rcx, [vd_len]
@@ -2932,8 +3383,11 @@ parse_def_header:
     cmp  dword [rdi], 'call'
     je   .redeclared
 .not_call:
-    call fn_find
-    test rax, rax
+    mov  al, [decl_pub]
+    call fn_clash
+    cmp  eax, 2
+    je   err_class_clash
+    test eax, eax
     jnz  .redeclared
     mov  eax, [fn_count]
     cmp  eax, FN_MAX
@@ -2945,6 +3399,10 @@ parse_def_header:
     mov  [r8], rax
     mov  rax, [vd_len]
     mov  [r8 + 8], rax
+    mov  al, [cur_file]
+    mov  [r8 + 160], al
+    mov  al, [priv_flag]
+    mov  [r8 + 161], al
     inc  dword [fn_count]
     inc  dword [fn_ids]
     mov  eax, [fn_ids]
@@ -2995,6 +3453,11 @@ parse_def_header:
 ; A parameter with no type word is a bin.  `ret value` gives a value back: call(NAME, x) can be used in an expression.
 ; The code of its body is skipped where the class is written.
 parse_class_header:
+    mov  byte [decl_pub], 1     ; a public class must not clash with the public classes of the other files
+    cmp  byte [priv_flag], 0
+    je   .pubdecl
+    mov  byte [decl_pub], 0
+.pubdecl:
     call read_new_name
     mov  rdi, [vd_name]
     mov  rcx, [vd_len]
@@ -3003,8 +3466,11 @@ parse_class_header:
     cmp  dword [rdi], 'call'
     je   .redeclared
 .not_call:
-    call fn_find
-    test rax, rax
+    mov  al, [decl_pub]
+    call fn_clash
+    cmp  eax, 2
+    je   err_class_clash
+    test eax, eax
     jnz  .redeclared
     mov  eax, [fn_count]
     cmp  eax, FN_MAX
@@ -3016,6 +3482,10 @@ parse_class_header:
     mov  [r8], rax
     mov  rax, [vd_len]
     mov  [r8 + 8], rax
+    mov  al, [cur_file]
+    mov  [r8 + 160], al
+    mov  al, [priv_flag]
+    mov  [r8 + 161], al
     inc  dword [fn_count]
     inc  dword [fn_ids]
     mov  eax, [fn_ids]
@@ -3076,10 +3546,176 @@ parse_call_target:
     mov  bx, ERR_CLASS_CALL
     jmp  error
 
+; The first line of the file may be exactly  [mem-mode ADVANCED]  : then mem.get / set / clear / copy use real addresses of the
+; running program and check nothing.  Without it they work in an arena of the program (mem.size bytes, 1 MiB by default).
+; Resets the mem. state; out: RSI moved past the flag.  Anything else that starts with [mem-mode on that line is error 0x124.
+mem_mode_scan:
+    mov  byte [mem_raw], 0
+    mov  byte [mem_used], 0
+    mov  byte [mem_sized], 0
+    mov  dword [mem_size], 0x100000
+    lea  rax, [rsi + 9]
+    cmp  rax, r12
+    ja   .no
+    cmp  dword [rsi], '[mem'
+    jne  .no
+    cmp  dword [rsi + 4], '-mod'
+    jne  .no
+    cmp  byte [rsi + 8], 'e'
+    jne  .no
+    lea  rax, [rsi + 19]
+    cmp  rax, r12
+    ja   .bad
+    cmp  dword [rsi + 9], ' ADV'
+    jne  .bad
+    cmp  dword [rsi + 13], 'ANCE'
+    jne  .bad
+    cmp  word [rsi + 17], 'D]'
+    jne  .bad
+    add  rsi, 19
+.rest:                          ; nothing but blanks (or a comment) may follow it on its line
+    cmp  rsi, r12
+    jae  .set
+    mov  al, [rsi]
+    cmp  al, ' '
+    je   .skip
+    cmp  al, 0x09
+    je   .skip
+    cmp  al, 0x0D
+    je   .skip
+    cmp  al, 0x0A
+    je   .set
+    cmp  al, '#'
+    je   .set
+    jmp  .bad
+.skip:
+    inc  rsi
+    jmp  .rest
+.set:
+    mov  byte [mem_raw], 1
+.no:
+    ret
+.bad:
+    mov  bx, ERR_MEM_MODE
+    jmp  error
+
+; RAX = the record of a built-in function: remember that a mem. function is in use
+note_builtin:
+    cmp  dword [rax + 16], MEM_ID_BASE
+    jb   .r
+    mov  byte [mem_used], 1
+.r: ret
+
+; in: RDI = path as written, RCX = its length.  out: RAX = the full path at inc_top (NUL-terminated, nothing is reserved yet), RCX = length.
+; A relative path is looked up next to the file that has the i\ line; on Linux the backslashes become slashes.
+import_join:
+    mov  r8, [inc_top]
+    xor  r9d, r9d               ; length of the directory part
+    movzx eax, byte [rdi]
+    cmp  al, '/'
+    je   .copy
+    cmp  al, '\'
+    je   .copy
+    cmp  rcx, 2
+    jb   .rel
+    cmp  byte [rdi + 1], ':'
+    je   .copy
+.rel:
+    movzx eax, byte [cur_file]
+    shl  eax, 4
+    lea  rdx, [inc_tab]
+    mov  r10, [rdx + rax]
+    mov  r11, [rdx + rax + 8]
+    xor  eax, eax
+.d: cmp  rax, r11
+    jae  .dd
+    mov  dl, [r10 + rax]
+    inc  rax
+    cmp  dl, '/'
+    je   .sep
+    cmp  dl, '\'
+    jne  .d
+.sep:
+    mov  r9, rax
+    jmp  .d
+.dd:
+    xor  eax, eax
+.c1:
+    cmp  rax, r9
+    jae  .copy
+    mov  dl, [r10 + rax]
+    mov  [r8 + rax], dl
+    inc  rax
+    jmp  .c1
+.copy:
+    xor  eax, eax
+.c2:
+    cmp  rax, rcx
+    jae  .end
+    mov  dl, [rdi + rax]
+%if HOST_TARGET == 1
+    cmp  dl, '\'
+    jne  .k
+    mov  dl, '/'
+.k:
+%endif
+    lea  r10, [r8 + r9]
+    mov  [r10 + rax], dl
+    inc  rax
+    jmp  .c2
+.end:
+    add  rcx, r9
+    mov  byte [r8 + rcx], 0
+    mov  rax, r8
+    ret
+
+err_class_clash:
+    mov  bx, ERR_CLASS_CLASH
+    jmp  error
+
+; in: RDI = name, RCX = length, AL = 1 when a public class is being declared
+; out: EAX = 0 free, 1 a function of this file has the name, 2 a public class of another file has it (only asked for a public class)
+fn_clash:
+    mov  [fc_pub], al
+    mov  r8d, [fn_count]
+    lea  rdx, [fn_table]
+.n: test r8d, r8d
+    jz   .none
+    cmp  [rdx + 8], rcx
+    jne  .s
+    mov  r9, [rdx]
+    xor  r10d, r10d
+.c: mov  al, [r9 + r10]
+    cmp  al, [rdi + r10]
+    jne  .s
+    inc  r10
+    cmp  r10, rcx
+    jb   .c
+    mov  al, [cur_file]
+    cmp  al, [rdx + 160]
+    je   .same
+    cmp  byte [fc_pub], 0
+    je   .s
+    cmp  byte [rdx + 30], 0
+    je   .s
+    cmp  byte [rdx + 161], 0
+    jne  .s
+    mov  eax, 2
+    ret
+.same:
+    mov  eax, 1
+    ret
+.s: add  rdx, FN_SIZE
+    dec  r8d
+    jmp  .n
+.none:
+    xor  eax, eax
+    ret
+
 ; in: RDI = token, RCX = length   out: RAX = the record of that fs. function, or 0
 fs_find:
     lea  rdx, [fs_table]
-    mov  r8d, FS_COUNT
+    mov  r8d, BI_COUNT
 .n: cmp  [rdx + 8], rcx
     jne  .s
     mov  r9, [rdx]
@@ -3107,14 +3743,18 @@ try_call:
     jz   .no
     cmp  rcx, 4
     jb   .nofs
+    cmp  dword [rdi], 'mem.'    ; mem.get( addr )
+    je   .isbi
     cmp  word [rdi], 'fs'       ; fs.name( args ): a file system function that gives a value
     jne  .nofs
     cmp  byte [rdi + 2], '.'
     jne  .nofs
+.isbi:
     call fs_find
     test rax, rax
     jz   .fs_unknown
     mov  [call_fn], rax
+    call note_builtin
     call skip_blanks
     cmp  rsi, r12
     jae  .fs_syntax
@@ -3273,7 +3913,34 @@ parse_call:
     jae  .arg_eof
     mov  al, [rsi]
     cmp  al, ','
+    je   .comma
+    cmp  qword [rbp], 1         ; ':' (mem.clear a:b) and '=' (mem.set a = v) only follow the first argument
     jne  .chk_close
+    mov  r8, [rbp + 96]
+    movzx edx, byte [r8 + 31]
+    cmp  al, ':'
+    jne  .not_colon
+    test dl, 1
+    jz   .chk_close
+    mov  byte [rbp + 106], 1    ; a ':' was used
+    inc  rsi
+    jmp  .arg
+.not_colon:
+    cmp  al, '='
+    jne  .chk_close
+    test dl, 8
+    jz   .chk_close
+    cmp  byte [rsi + 1], '='    ; '==' is a comparison, not a separator
+    je   .chk_close
+    inc  rsi
+    jmp  .arg
+.comma:
+    cmp  qword [rbp], 1
+    jne  .comma_ok
+    mov  r8, [rbp + 96]
+    test byte [r8 + 31], 2      ; mem.clear wants a ':'
+    jnz  .syntax
+.comma_ok:
     inc  rsi
     jmp  .arg
 .chk_close:
@@ -3285,7 +3952,21 @@ parse_call:
     mov  r8, [rbp + 96]
     movzx edx, byte [r8 + 20]
     cmp  [rbp], rdx
+    jne  .try_opt
+    test byte [r8 + 31], 4      ; mem.copy a:b, dst needs its ':' (a, b, dst would read like src, dst, length)
+    jz   .count_ok
+    cmp  byte [rbp + 106], 0
+    je   .syntax
+    jmp  .count_ok
+.try_opt:
+    test byte [r8 + 31], 4      ; mem.copy src, dst: the end of the range can be left out ...
+    jz   .argcount
+    dec  rdx
+    cmp  [rbp], rdx
     jne  .argcount
+    cmp  byte [rbp + 106], 0    ; ... but not after a ':'
+    jne  .argcount
+.count_ok:
     cmp  byte [rbp + 105], 0
     jne  .no_paren
     inc  rsi
@@ -3293,6 +3974,8 @@ parse_call:
     mov  [w_fn], r8
     mov  eax, [rbp + 8]
     mov  [w_site], eax
+    mov  rax, [rbp]
+    mov  [w_nargs], eax
     call write_call_emit
     cmp  qword [rbp + 80], 0
     je   .nosb2
