@@ -1,55 +1,110 @@
-class extract_npms(path,target,vov): # Path points to the file. Target can be used to search for one or more specific parameters. Target can also be left empty to return a list instead. Vov is used to determine whether the script should output the .npms file's variable names or variable content ONLY when no target is set.
+# npms_reader.ns - reads a .npms (Nano Package Metadata Storage) file.
+#
+# extract_npms(path, target, vov)
+#   path    the .npms file
+#   target  a variable name: returns that variable's value (or "notFound").
+#           Leave it "" to get a whole list instead.
+#   vov     only used when target is "":  "names" -> the variable names,
+#           "values" or "vals" -> the values they are set to
+# Errors come back as text: pathNotFound, incorrectExtension, notFound, invalidVOVOption.
+#
+# File format it reads:   name = "value"     one per line, # starts a comment line.
+
+list lstr __vars
+list lstr __vals
+
+class extract_npms(path, target, vov):
 	tvar lstr __out
-	if not fs.exists(path):
-		__out = "pathNotFound"
-		return __out
-	elif path.length << 6:
+	tvar num __n = path.length
+	if __n << 6:                              # ".npms" plus at least one letter
 		__out = "incorrectExtension"
-	elif not path[{path.length-4}:{path.length}] = ".npms":
-		__out = "incorrectExtension
-		return __out
-	index(path)
-	if not target = "":
-		for __i = __vars.length:
-			if __vars[__i] == target:
-				__out = __vals[__i]
-				return __out
+		ret __out
+	tvar num __e = __n - 5                   # the last five characters must be .npms
+	if not path[__e] == ".":
+		__out = "incorrectExtension"
+		ret __out
+	__e += 1
+	if not path[__e] == "n":
+		__out = "incorrectExtension"
+		ret __out
+	__e += 1
+	if not path[__e] == "p":
+		__out = "incorrectExtension"
+		ret __out
+	__e += 1
+	if not path[__e] == "m":
+		__out = "incorrectExtension"
+		ret __out
+	__e += 1
+	if not path[__e] == "s":
+		__out = "incorrectExtension"
+		ret __out
+	if not fs.exists path:
+		__out = "pathNotFound"
+		ret __out
+	index(path)                              # fills __vars and __vals
+	if not target == "":
+		tvar num __i = 0
+		for __i = list.__vars.length:
+			if list.__vars[__i] == target:
+				__out = list.__vals[__i]
+				ret __out
 		__out = "notFound"
-		return __out
+		ret __out
 	else:
 		if vov == "names":
-			return __vars
+			ret list.__vars
 		elif vov == "values":
-			return __vals
+			ret list.__vals
 		elif vov == "vals":
-			return __vals
+			ret list.__vals
 		else:
 			__out = "invalidVOVOption"
-			return __out
-		
+			ret __out
 
+# Walks the file once, one character at a time. __state says where we are:
+#   0 reading a name      1 skipping the rest of a line (comment / after a value)
+#   2 after "=", waiting for the opening quote      3 reading a value
 private class index(path):
-	tvar lstr __file = fs.open(path) # Open the file and store it in the temporary variable
-	list __vars
-	list __vals
-	tvar str __flags
+	tvar lstr __file = fs.read(path)
+	list.__vars.clear
+	list.__vals.clear
+	tvar lstr __nl = """
+"""
+	tvar lstr __v = ""
+	tvar str __c
+	tvar num __state = 0
+	tvar num __i = 0
 	for __i = __file.length:
-		if __file[__i] == """
-		""":
-			__flags = "nL"
-		elif __file[__i] == "=":
-			__flags = "equ"
-		elif __file[__i] == '"':
-			if __flags = "val":
-			tvar int __t
-			tvar lstr __v
-			until __file[__t-1] == '"':
-				__v = __v,{__file[__t]}
-				__t += 1
-			__vals.append(__v)
-		if __flags == "equ":
-			tvar int __t = __i
-			tvar lstr __v
-			until __file[__t-1] == "	":
-				__v = __v,{__file[__t]}
-				__t += 1
+		__c = __file[__i]
+		if __state == 1:
+			if __c == __nl:
+				__state = 0
+		elif __state == 0:
+			if __c == "#":
+				__state = 1
+			elif __c == "=":
+				__vars.append __v   # the name is complete
+				__v = ""
+				__state = 2
+			elif __c == __nl:
+				__v = ""                  # blank line or stray text
+			elif __c == " ":
+				__v = __v                 # spaces and tabs are not part of a name
+			elif __c == "	":
+				__v = __v
+			else:
+				__v = __v,__c
+		elif __state == 2:
+			if __c == '"':
+				__state = 3
+			elif __c == __nl:
+				__vals.append ""     # "name =" with no value
+				__state = 0
+		else:
+			if __c == '"':
+				__vals.append __v    # the value is complete
+				__v = ""
+				__state = 1
+			else:
+				__v = __v,__c
