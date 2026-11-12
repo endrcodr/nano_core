@@ -196,6 +196,8 @@ section .bss
     cb_chain    resd 1              ; chain / branch numbers that the writer prints in labels
     cb_k        resd 1
     bl_first    resb 1              ; 1 = the statement is the first thing on its line
+    cond_not    resb 1              ; the condition started with  not
+    ls_short    resb 1              ; the list statement is  NAME.method  (no list. in front)
     cond_op     resb 1              ; comparison: 1 ==, 2 !=, 3 <, 4 >, 5 <=, 6 >=
     cmp_ltype   resb 1              ; type of the left operand: 0 num, 1 str
     cmp_tmp     resb 1
@@ -1816,6 +1818,7 @@ match_keyword:
     jne  .try_mem
     cmp  byte [rdi + 4], '.'
     jne  .try_mem
+    mov  byte [ls_short], 0
     mov  eax, FN_LISTOP
     ret
 .try_mem:
@@ -1835,6 +1838,41 @@ match_keyword:
     mov  eax, FN_FS
     ret
 .none:
+    jmp  list_short
+
+; NAME.method where NAME is a list: the same as list.NAME.method
+list_short:
+    xor  r8d, r8d
+.f: cmp  r8, rcx
+    jae  .no
+    cmp  byte [rdi + r8], '.'
+    je   .dot
+    inc  r8
+    jmp  .f
+.dot:
+    test r8, r8
+    jz   .no
+    lea  rax, [r8 + 1]
+    cmp  rax, rcx
+    jae  .no
+    push rdi
+    push rcx
+    mov  rcx, r8
+    call find_var
+    pop  rcx
+    pop  rdi
+    test rax, rax
+    jz   .no
+    movzx eax, byte [rax + 1]
+    and  eax, VAR_TYPE_MASK
+    cmp  eax, 3
+    jb   .no
+    cmp  eax, 4
+    ja   .no
+    mov  byte [ls_short], 1
+    mov  eax, FN_LISTOP
+    ret
+.no:
     xor  eax, eax
     ret
 
@@ -2674,6 +2712,7 @@ parse_value_expr:
     jb   .not_list
     cmp  eax, 4
     ja   .not_list
+.list_typed:
     cmp  byte [expr_kind], 1
     je   .list_len
     sub  eax, 3                 ; element type: list num -> num, list str -> str
@@ -2697,6 +2736,17 @@ parse_value_expr:
     jz   .unknown
     movzx eax, byte [rax + 1]
     and  eax, VAR_TYPE_MASK
+    cmp  eax, 3                 ; NAME.length / NAME[#] of a list, without list. in front
+    jb   .p_notlist
+    cmp  eax, 4
+    ja   .p_notlist
+    cmp  byte [expr_kind], 1
+    je   .list_typed
+    cmp  rsi, r12
+    jae  .p_notlist
+    cmp  byte [rsi], '['
+    je   .list_typed
+.p_notlist:
     cmp  byte [expr_kind], 1
     je   .str_len
     cmp  rsi, r12
@@ -2804,6 +2854,10 @@ parse_list_op:
     cmp  byte [r8], '.'
     jne  .back
     lea  r9, [rdi + 5]          ; start of NAME
+    cmp  byte [ls_short], 0
+    je   .nm5
+    mov  r9, rdi                ; NAME.method: no "list." in front
+.nm5:
     cmp  r8, r9
     jbe  .syntax                ; no name, or no method ("list.x")
     mov  [ls_name], r9
@@ -3757,10 +3811,15 @@ try_call:
     call note_builtin
     call skip_blanks
     cmp  rsi, r12
-    jae  .fs_syntax
+    jae  .fs_np
     cmp  byte [rsi], '('
-    jne  .fs_syntax
+    jne  .fs_np
     inc  rsi
+    add  rsp, 8
+    mov  eax, 1
+    ret
+.fs_np:                         ; fs.exists path : no parentheses, the end of the statement (or the ':') closes the call
+    mov  byte [call_np], 1
     add  rsp, 8
     mov  eax, 1
     ret
@@ -4045,6 +4104,8 @@ parse_call:
     cmp  al, 0x0A
     je   .yes
     cmp  al, 0x0D
+    je   .yes
+    cmp  al, ':'
     je   .yes
     cmp  al, '#'
 .yes:
@@ -4898,6 +4959,24 @@ parse_assign:
 
 ; in: [cb_chain] / [cb_k] = label to jump to when the condition fails; RSI after the keyword
 parse_condition:
+    mov  byte [cond_not], 0
+    call skip_blanks
+    lea  rax, [rsi + 4]         ; "not" and a blank: the condition is turned around
+    cmp  rax, r12
+    jae  .nn
+    cmp  word [rsi], 'no'
+    jne  .nn
+    cmp  byte [rsi + 2], 't'
+    jne  .nn
+    mov  al, [rsi + 3]
+    cmp  al, ' '
+    je   .nn_yes
+    cmp  al, 0x09
+    jne  .nn
+.nn_yes:
+    add  rsi, 3
+    mov  byte [cond_not], 1
+.nn:
     mov  byte [cmp_ltype], 0xFF
     call parse_cmp_operand      ; AL = type, the value is left in RAX by the generated code
     mov  [cmp_ltype], al
@@ -4929,6 +5008,7 @@ parse_condition:
     jne  .emit
     call write_bin_eq           ; the comparison is made on 1 / 0
 .emit:
+    call cond_flip
     jmp  write_cmp_jump
 .truthy:                        ; "if x:" is "if x != 0:"
     cmp  byte [cmp_ltype], 0
@@ -4936,6 +5016,7 @@ parse_condition:
     mov  byte [cond_op], 2
     mov  qword [cmp_imm], 0
     call write_mov_rax_imm
+    call cond_flip
     jmp  write_cmp_jump
 .no_colon:
     mov  bx, ERR_EXPECT_COLON
@@ -4946,6 +5027,17 @@ parse_condition:
 .bad_cmp:
     mov  bx, ERR_BAD_COMPARE
     jmp  error
+
+; not: == <-> !=, < <-> >=, > <-> <=
+cond_flip:
+    cmp  byte [cond_not], 0
+    je   .r
+    movzx eax, byte [cond_op]
+    lea  rdx, [cond_inv]
+    mov  al, [rdx + rax]
+    mov  [cond_op], al
+.r: ret
+cond_inv: db 0, 2, 1, 6, 5, 4, 3
 
 ; One operand; the generated code leaves its value in RAX.  out: AL = type (0 num, 1 str)
 parse_cmp_operand:
@@ -5048,13 +5140,23 @@ parse_cmp_op:                   ; -> cond_op
     jne  .syntax
     inc  rsi
     ret
-.lt:
+.lt:                            ; "<<" is "less than" too (and "<" still works)
     mov  byte [cond_op], 3
     mov  cl, 5
+    cmp  rsi, r12
+    jae  .maybe_eq
+    cmp  byte [rsi], '<'
+    jne  .maybe_eq
+    inc  rsi
     jmp  .maybe_eq
-.gt:
+.gt:                            ; ">>" is "greater than"
     mov  byte [cond_op], 4
     mov  cl, 6
+    cmp  rsi, r12
+    jae  .maybe_eq
+    cmp  byte [rsi], '>'
+    jne  .maybe_eq
+    inc  rsi
 .maybe_eq:                      ; "<=" / ">="
     cmp  rsi, r12
     jae  .done
