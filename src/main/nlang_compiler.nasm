@@ -1324,6 +1324,16 @@ compile:
     call parse_call
     call expect_end
     jmp  .stmt_done
+.call_named:                    ; RSI at the class name
+    call parse_call_named
+    mov  r14d, FN_ASSIGN
+    mov  rdi, [as_name]
+    mov  rcx, [as_len]
+    call note_stmt
+    mov  al, 1
+    call parse_call
+    call expect_end
+    jmp  .stmt_done
 .call_class:                    ; RSI at '('
     inc  rsi
     call parse_call_target
@@ -1352,6 +1362,16 @@ compile:
     call skip_blanks
     cmp  rsi, r12
     jae  .func_logic
+    cmp  qword [as_len], 4      ; call NAME(args): runs a class, the name goes after "call"
+    jne  .not_named
+    mov  rdi, [as_name]
+    cmp  dword [rdi], 'call'
+    jne  .not_named
+    mov  al, [rsi]
+    call is_ident_start
+    test eax, eax
+    jnz  .call_named
+.not_named:
     mov  al, [rsi]
     cmp  al, '('
     je   .call_stmt
@@ -3567,6 +3587,35 @@ parse_class_header:
     mov  bx, ERR_TABLE_FULL
     jmp  error
 
+; call NAME( args ):  RSI is at NAME.  Reads the name and the '(' : [call_fn] = the class, RSI is where parse_call expects
+; the arguments (or the ')').
+parse_call_named:
+    call read_ident
+    test rcx, rcx
+    jz   .syntax
+    call fn_find
+    test rax, rax
+    jz   .unknown
+    cmp  byte [rax + 30], 0
+    je   .class_err
+    mov  [call_fn], rax
+    call skip_blanks
+    cmp  rsi, r12
+    jae  .syntax
+    cmp  byte [rsi], '('
+    jne  .syntax
+    inc  rsi
+    ret
+.syntax:
+    mov  bx, ERR_INVALID_VAR_SYNTAX
+    jmp  error
+.unknown:
+    mov  bx, ERR_UNKNOWN_VAR
+    jmp  error
+.class_err:
+    mov  bx, ERR_CLASS_CALL
+    jmp  error
+
 ; call( NAME, args ):  RSI is just past the '(' .  Reads the class name and the comma after it: [call_fn] = the class and
 ; RSI is where parse_call expects the arguments (or the ')').
 parse_call_target:
@@ -3838,9 +3887,18 @@ try_call:
     cmp  rsi, r12
     jae  .no
     cmp  byte [rsi], '('
-    jne  .no
+    jne  .call_nm
     inc  rsi
     call parse_call_target
+    add  rsp, 8
+    mov  eax, 1
+    ret
+.call_nm:                       ; call NAME( args )
+    mov  al, [rsi]
+    call is_ident_start
+    test eax, eax
+    jz   .no
+    call parse_call_named
     add  rsp, 8
     mov  eax, 1
     ret
