@@ -14,7 +14,8 @@ section .bss
     bytes_read  resq 1
     path_buf    resb PATH_MAX
     verbose     resb 1              ; 1 with -v / --verbose: show every statement
-    resb 7
+    run_flag    resb 1              ; 1 with -r / --run: assemble in memory and run, write no .nasm
+    resb 6
     buffer      resb BUFFER_SIZE
 
 section .text
@@ -61,11 +62,33 @@ main_opener:
     cmp  al, '-'
     jne  .path
     cmp  word [rsi], '-v'       ; flag: -v  or  --verbose  (then a space, or the end)
-    jne  .long_flag
+    jne  .try_r
     movzx eax, byte [rsi + 2]
     mov  ecx, 2
     jmp  .flag_end
+.try_r:                         ; -r  or  --run
+    cmp  word [rsi], '-r'
+    jne  .long_flag
+    movzx eax, byte [rsi + 2]
+    mov  ecx, 2
+    jmp  .run_end
 .long_flag:
+    cmp  dword [rsi], '--ru'
+    jne  .not_run
+    cmp  byte [rsi + 4], 'n'
+    jne  .path
+    movzx eax, byte [rsi + 5]
+    mov  ecx, 5
+.run_end:
+    test al, al
+    jz   .set_run
+    cmp  al, ' '
+    jne  .path
+.set_run:
+    mov  byte [run_flag], 1
+    add  rsi, rcx
+    jmp  .skip_spaces
+.not_run:
     cmp  dword [rsi], '--ve'
     jne  .try_win
     cmp  dword [rsi + 4], 'rbos'

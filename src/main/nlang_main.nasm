@@ -57,6 +57,9 @@ extern CreateFileA
 extern ReadFile
 extern WriteFile
 extern CloseHandle
+extern VirtualAlloc
+extern GetModuleHandleA
+extern GetProcAddress
 global main
 %else
 global _start
@@ -66,6 +69,7 @@ global _start
 ; `section` directives and would otherwise be executed as code.
 %include "nlang_opener.nasm"
 %include "nlang_compiler.nasm"
+%include "nlang_interpreter.nasm"
 
 section .bss
     os_h    resq 1
@@ -105,8 +109,279 @@ nano_start:
     mov  eax, 1
     jmp  .exit
 
+; ---- --run: assemble the program in memory and run it ---------------------------------------------------------
+; out_buf holds the NASM text the compiler just wrote. interp_run never returns: the program ends with its own exit.
+;   Linux:   the image is mapped at ASM_BASE with mmap and the program's own _start is entered.
+;   Windows: the image is mapped at ASM_BASE with VirtualAlloc.  Every `extern NAME` of the program gets a small stub
+;            `NAME: jmp [__imp_NAME]` appended to the text, and the pointer behind it is filled with GetProcAddress
+;            (kernel32.dll) once the image exists.  Then the program's `main` is called like a Windows function.
 section .data
-STR s_usage, `nlang: cannot read the input file.\nUsage: nlang [-v] [--win64|--linux] <file.n | file.nc | file.ns>\n  -v, --verbose   show every statement as it is compiled\n  --win64         write a program for Windows (the default on Windows)\n  --linux         write a program for Linux (the default on Linux)\n`
+STR s_run_asm, "nlang: assembler error "
+STR s_run_line, " at line "
+STR s_run_nl, `\n`
+STR s_run_map, `nlang: cannot map memory for the program\n`
+STR s_run_win, `nlang: --run only runs programs for the system nlang itself runs on (not --win64 / --linux of the other one)\n`
+STR s_run_imp, `nlang: cannot find a Windows function the program needs\n`
+s_run_start: db "_start"
+s_run_main:  db "main"
+s_run_k32:   db "kernel32.dll", 0
+STR s_st_a, `\nsection .data\n__imp_`
+STR s_st_b, `: dq 0\nsection .text\n`
+STR s_st_c, `: jmp [__imp_`
+STR s_st_d, `]\n`
+section .bss
+ext_tab: resb 64 * 32           ; the externs of the program: a length byte, then up to 31 characters
+ext_cnt: resd 1
+ext_i:   resd 1
+ext_h:   resq 1
+ext_fn:  resq 1
+ext_len: resd 1
+ext_buf: resb 64
+section .text
+%macro EMIT_AT 2
+    lea  rdx, [%1]
+    mov  r8d, %2
+    call emit_bytes
+%endmacro
+interp_run:
+    sub  rsp, 72                ; entry rsp is 8 mod 16: now aligned, 32 bytes of shadow space for Windows calls
+%ifdef HOST_LINUX
+    cmp  byte [target], 1
+%else
+    cmp  byte [target], 0
+%endif
+    jne  .nosys
+%ifdef HOST_WINDOWS
+    call win_collect_externs
+    call win_emit_stubs
+%endif
+    lea  rsi, [out_buf]
+    mov  rcx, [out_len]
+    call asm_pass01
+    test eax, eax
+    jnz  .asmerr
+%ifdef HOST_LINUX
+    mov  eax, 9                 ; mmap(ASM_BASE, size, RWX, PRIVATE|ANON|FIXED_NOREPLACE)
+    mov  edi, ASM_BASE
+    mov  rsi, [asm_size]
+    mov  edx, 7
+    mov  r10d, 0x100022
+    mov  r8, -1
+    xor  r9d, r9d
+    syscall
+%else
+    mov  ecx, ASM_BASE          ; VirtualAlloc(ASM_BASE, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+    mov  rdx, [asm_size]
+    mov  r8d, 0x3000
+    mov  r9d, 0x40
+    call VirtualAlloc
+%endif
+    cmp  rax, ASM_BASE
+    jne  .nomap
+    mov  edi, ASM_BASE
+    call asm_pass2
+    test eax, eax
+    jnz  .asmerr
+%ifdef HOST_LINUX
+    lea  rsi, [s_run_start]
+    mov  ecx, 6
+    call asm_lookup
+    test rax, rax
+    jz   .asmerr
+    jmp  rax                    ; the program's own _start: it ends with the exit system call
+%else
+    lea  rcx, [s_run_k32]
+    call GetModuleHandleA
+    mov  [ext_h], rax
+    mov  dword [ext_i], 0
+.imp:                           ; for every extern: GetProcAddress, then store it behind __imp_NAME
+    mov  eax, [ext_i]
+    cmp  eax, [ext_cnt]
+    jae  .imp_done
+    shl  eax, 5
+    lea  rbx, [ext_tab + rax]
+    movzx ecx, byte [rbx]       ; length of the name
+    mov  [ext_len], ecx
+    lea  rdi, [ext_buf + 6]     ; "__imp_" + name, kept for the lookup
+    lea  rsi, [rbx + 1]
+    rep  movsb
+    mov  byte [rdi], 0          ; the plain name, NUL ended, is at ext_buf + 6
+    mov  dword [ext_buf], '__im'
+    mov  word [ext_buf + 4], 'p_'
+    mov  rcx, [ext_h]
+    lea  rdx, [ext_buf + 6]
+    call GetProcAddress
+    test rax, rax
+    jz   .noimp
+    mov  [ext_fn], rax
+    lea  rsi, [ext_buf]
+    mov  ecx, [ext_len]
+    add  ecx, 6
+    call asm_lookup             ; the address of __imp_NAME in the image
+    test rax, rax
+    jz   .asmerr
+    mov  rdx, [ext_fn]
+    mov  [rax], rdx
+    inc  dword [ext_i]
+    jmp  .imp
+.imp_done:
+    lea  rsi, [s_run_main]
+    mov  ecx, 4
+    call asm_lookup
+    test rax, rax
+    jz   .asmerr
+    and  rsp, -16
+    sub  rsp, 32
+    call rax                    ; main: sub rsp, 40 ... it ends with ExitProcess
+    xor  ecx, ecx
+    call os_exit
+.noimp:
+    mov  ecx, 2
+    lea  rdx, [s_run_imp]
+    mov  r8d, s_run_imp_len
+    call os_write_std
+    mov  ecx, 3
+    call os_exit
+%endif
+.asmerr:
+    mov  dword [mb_len], 0
+    PUT  s_run_asm
+    mov  eax, [asm_err]
+    call put_dec
+    PUT  s_run_line
+    mov  eax, [asm_err_line]
+    call put_dec
+    PUT  s_run_nl
+    mov  ecx, 2
+    lea  rdx, [msg_buf]
+    mov  r8d, [mb_len]
+    call os_write_std
+    mov  ecx, 3
+    call os_exit
+.nomap:
+    mov  ecx, 2
+    lea  rdx, [s_run_map]
+    mov  r8d, s_run_map_len
+    call os_write_std
+    mov  ecx, 3
+    call os_exit
+.nosys:
+    mov  ecx, 2
+    lea  rdx, [s_run_win]
+    mov  r8d, s_run_win_len
+    call os_write_std
+    mov  ecx, 3
+    call os_exit
+
+%ifdef HOST_WINDOWS
+; ext_tab = the distinct names after "extern " at the start of a line of out_buf
+win_collect_externs:
+    mov  dword [ext_cnt], 0
+    lea  rsi, [out_buf]
+    mov  rdi, rsi
+    add  rdi, [out_len]         ; the end of the text
+.line:
+    lea  rax, [rsi + 8]
+    cmp  rax, rdi
+    ja   .done
+    cmp  dword [rsi], 'exte'
+    jne  .next
+    cmp  word [rsi + 4], 'rn'
+    jne  .next
+    cmp  byte [rsi + 6], ' '
+    jne  .next
+    lea  r8, [rsi + 7]          ; the name
+    xor  ecx, ecx
+.len:
+    movzx eax, byte [r8 + rcx]
+    cmp  al, ' '
+    jbe  .got
+    cmp  al, ';'
+    je   .got
+    inc  ecx
+    cmp  ecx, 31
+    jb   .len
+.got:
+    test ecx, ecx
+    jz   .next
+    xor  edx, edx               ; already in the table?
+.dup:
+    cmp  edx, [ext_cnt]
+    jae  .add
+    mov  eax, edx
+    shl  eax, 5
+    lea  r9, [ext_tab + rax]
+    movzx eax, byte [r9]
+    cmp  eax, ecx
+    jne  .dup_next
+    push rsi
+    push rdi
+    push rcx
+    lea  rsi, [r9 + 1]
+    mov  rdi, r8
+    repe cmpsb
+    pop  rcx
+    pop  rdi
+    pop  rsi
+    je   .next                  ; the same name
+.dup_next:
+    inc  edx
+    jmp  .dup
+.add:
+    cmp  dword [ext_cnt], 64
+    jae  .next
+    mov  eax, [ext_cnt]
+    shl  eax, 5
+    lea  r9, [ext_tab + rax]
+    mov  [r9], cl
+    push rsi
+    push rdi
+    lea  rdi, [r9 + 1]
+    mov  rsi, r8
+    rep  movsb
+    pop  rdi
+    pop  rsi
+    inc  dword [ext_cnt]
+.next:
+    cmp  rsi, rdi
+    jae  .done
+    cmp  byte [rsi], 0x0A
+    lea  rsi, [rsi + 1]
+    jne  .next
+    jmp  .line
+.done:
+    ret
+
+; append the stub of every extern to out_buf (the assembler ignores `extern` itself)
+win_emit_stubs:
+    mov  dword [ext_i], 0
+.each:
+    mov  eax, [ext_i]
+    cmp  eax, [ext_cnt]
+    jae  .r
+    shl  eax, 5
+    lea  rbx, [ext_tab + rax]
+    movzx r13d, byte [rbx]
+    EMIT_AT s_st_a, s_st_a_len
+    lea  rdx, [rbx + 1]
+    mov  r8d, r13d
+    call emit_bytes
+    EMIT_AT s_st_b, s_st_b_len
+    lea  rdx, [rbx + 1]
+    mov  r8d, r13d
+    call emit_bytes
+    EMIT_AT s_st_c, s_st_c_len
+    lea  rdx, [rbx + 1]
+    mov  r8d, r13d
+    call emit_bytes
+    EMIT_AT s_st_d, s_st_d_len
+    inc  dword [ext_i]
+    jmp  .each
+.r: ret
+%endif
+
+section .data
+STR s_usage, `nlang: cannot read the input file.\nUsage: nlang [-v] [-r|--run] [--win64|--linux] <file.n | file.nc | file.ns>\n  -v, --verbose   show every statement as it is compiled\n  -r, --run       run the program at once instead of writing a .nasm file\n  --win64         write a program for Windows (the default on Windows)\n  --linux         write a program for Linux (the default on Linux)\n`
 section .text
 
 ; ===================================================================================================================

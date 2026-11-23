@@ -120,7 +120,9 @@ ERR_IMPORT_READ        equ 38   ; the included file can't be read (or is bigger 
 ERR_IMPORT_LIMIT       equ 39   ; too many included files or includes nested too deep
 ERR_PRIVATE            equ 40   ; private is not followed by var, tvar, list, class or def
 ERR_CLASS_CLASH        equ 41   ; a public class with this name exists in another file
-ERR_COUNT              equ 37   ; number of messages in err_msgs (codes 5..41)
+ERR_INTERPRET          equ 42   ; [interpret] is wrong or is not alone on the first line
+ERR_NEED_RUN           equ 43   ; the script starts with [interpret] but --run was not given
+ERR_COUNT              equ 39   ; number of messages in err_msgs (codes 5..43)
 
 VAR_TABLE_SIZE equ 0x10000
 
@@ -239,6 +241,7 @@ section .bss
     fn_ids      resd 1              ; functions seen so far: their number is used in the labels
     fn_count    resd 1
     call_ctr    resd 1              ; call sites so far
+    mem_seen    resb 1              ; mem_mode_scan has run once
     mem_raw     resb 1              ; [mem-mode ADVANCED] on the first line: mem. uses real addresses
     mem_used    resb 1              ; a mem. function has been used
     mem_sized   resb 1              ; mem.size has been used
@@ -414,6 +417,8 @@ err_msgs:
     MSG "too many included files (63), or includes nested more than 8 deep" ; 39
     MSG "private goes in front of var, tvar, list, class or def" ; 40
     MSG "a public class with this name is already defined in another file (use private or another name)" ; 41
+    MSG "[interpret] must be alone on its line, once, before any code (nothing but blanks or a # comment after it)" ; 42
+    MSG "this script is marked [interpret]: it is never compiled, run it with  nlang --run <file>" ; 43
 
 STR s_msg_err,  "nlang: error 0x"
 STR s_msg_line, " (line "
@@ -583,6 +588,10 @@ compile:
     jmp  .nul_scan
 .text_ok:
     call mem_mode_scan          ; [mem-mode ADVANCED] on the first line
+    call skip_blank_lines       ; blank lines and comments may come before [interpret]
+    call interpret_scan         ; [interpret] before any code (then --run is required)
+    call skip_blank_lines
+    call mem_mode_scan          ; [mem-mode ADVANCED] after [interpret] (does nothing when it was already seen on line 1)
     call print_start            ; "nlang: compiling <file> (N bytes)"
     call out_begin              ; NASM header
 
@@ -616,12 +625,19 @@ compile:
     cmp  rcx, r12
     ja   .next_char
     cmp  dword [rsi], '[mem'
-    jne  .next_char
+    jne  .chk_interp
     cmp  dword [rsi + 4], '-mod'
     jne  .next_char
     cmp  byte [rsi + 8], 'e'
     jne  .next_char
     mov  bx, ERR_MEM_MODE
+    jmp  error
+.chk_interp:                    ; [interpret] anywhere but the first line is a mistake too
+    cmp  dword [rsi], '[int'
+    jne  .next_char
+    cmp  dword [rsi + 4], 'erpr'
+    jne  .next_char
+    mov  bx, ERR_INTERPRET
     jmp  error
     ; Operators, quotes, brackets...: not handled yet (TODO), just skip them.
 
@@ -1536,6 +1552,12 @@ print_error:
 
 ; "nlang: wrote <output file>"  -> stdout
 print_ok:
+    cmp  byte [run_flag], 0
+    jne  .quiet
+    jmp  .go_print_ok
+.quiet:
+    ret
+.go_print_ok:
     mov  dword [mb_len], 0
     PUT  s_msg_wrote
     lea  rdx, [out_path]
@@ -1563,6 +1585,12 @@ flush_stdout:
 
 ; "nlang: compiling .\script.n (2314 bytes)"   (", package file" for a .ns)
 print_start:
+    cmp  byte [run_flag], 0
+    jne  .quiet
+    jmp  .go_print_start
+.quiet:
+    ret
+.go_print_start:
     mov  dword [mb_len], 0
     PUT  s_msg_comp
     lea  rdx, [path_buf]
@@ -1591,6 +1619,10 @@ print_start:
 
 ; "nlang: done - 31 statements (2 not compiled yet), 24 names declared"
 print_summary:
+    cmp  byte [run_flag], 0
+    je   .go_summary
+    ret
+.go_summary:
     mov  dword [mb_len], 0
     PUT  s_msg_done
     mov  eax, [stmt_count]
@@ -3653,10 +3685,18 @@ parse_call_target:
 ; running program and check nothing.  Without it they work in an arena of the program (mem.size bytes, 1 MiB by default).
 ; Resets the mem. state; out: RSI moved past the flag.  Anything else that starts with [mem-mode on that line is error 0x124.
 mem_mode_scan:
+    cmp  byte [mem_seen], 0     ; second call (after [interpret]): the state was reset already, and [mem-mode] may only appear once
+    jne  .again
+    mov  byte [mem_seen], 1
     mov  byte [mem_raw], 0
     mov  byte [mem_used], 0
     mov  byte [mem_sized], 0
     mov  dword [mem_size], 0x100000
+    jmp  .first
+.again:
+    cmp  byte [mem_raw], 0
+    jne  .no                    ; already on: a second one is caught as a mistake by the main loop
+.first:
     lea  rax, [rsi + 9]
     cmp  rax, r12
     ja   .no
@@ -3701,6 +3741,113 @@ mem_mode_scan:
 .bad:
     mov  bx, ERR_MEM_MODE
     jmp  error
+
+;  The first line of the file may be exactly  [interpret]  : the script is only ever run, never compiled to a .nasm file.  It needs
+;  --run on the command line (error 0x12B otherwise); without --run nothing is written.  Then [mem-mode ADVANCED] may follow on line 2.
+;  In: RSI = start of the text.  Out: RSI = start of the next line when the flag was there.  Anything else that starts with [interp on
+;  the first line is error 0x12A.  (Included .ns files do not go through here.)
+interpret_scan:
+    lea  rax, [rsi + 11]
+    cmp  rax, r12
+    ja   .no
+    cmp  dword [rsi], '[int'
+    jne  .no
+    cmp  dword [rsi + 4], 'erpr'
+    jne  .no
+    cmp  word [rsi + 8], 'et'
+    jne  .bad
+    cmp  byte [rsi + 10], ']'
+    jne  .bad
+    mov  rdx, rsi               ; (the error for a missing --run points at line 1)
+    add  rsi, 11
+.rest:                          ; nothing but blanks (or a comment) may follow it on its line
+    cmp  rsi, r12
+    jae  .set
+    mov  al, [rsi]
+    cmp  al, ' '
+    je   .skip
+    cmp  al, 0x09
+    je   .skip
+    cmp  al, 0x0D
+    je   .skip
+    cmp  al, 0x0A
+    je   .eol
+    cmp  al, '#'
+    je   .comment
+    jmp  .bad
+.skip:
+    inc  rsi
+    jmp  .rest
+.comment:                       ; a # comment to the end of the line
+    cmp  rsi, r12
+    jae  .set
+    cmp  byte [rsi], 0x0A
+    je   .eol
+    inc  rsi
+    jmp  .comment
+.eol:
+    inc  rsi                    ; past the newline: line 2 is the next line
+.set:
+    cmp  byte [run_flag], 0
+    jne  .no
+    mov  rsi, rdx
+    mov  bx, ERR_NEED_RUN       ; never compile an [interpret] script
+    jmp  error
+.no:
+    ret
+.bad:
+    mov  bx, ERR_INTERPRET
+    jmp  error
+
+; Skips blank lines, # comments and ### block comments before the first statement.  In/out: RSI.
+skip_blank_lines:
+    cmp  rsi, r12
+    jae  .r
+    movzx eax, byte [rsi]
+    cmp  al, ' '
+    je   .next
+    cmp  al, 0x09
+    je   .next
+    cmp  al, 0x0D
+    je   .next
+    cmp  al, 0x0A
+    je   .next
+    cmp  al, '#'
+    jne  .r
+    lea  rax, [rsi + 3]
+    cmp  rax, r12
+    ja   .line
+    cmp  word [rsi], '##'
+    jne  .line
+    cmp  byte [rsi + 2], '#'
+    jne  .line
+    mov  rcx, rsi               ; ### ... ###: look for the closing one (not found: leave it to the main loop, it reports it)
+    add  rcx, 3
+.blk:
+    lea  rax, [rcx + 3]
+    cmp  rax, r12
+    ja   .r
+    cmp  word [rcx], '##'
+    jne  .blk_next
+    cmp  byte [rcx + 2], '#'
+    je   .blk_end
+.blk_next:
+    inc  rcx
+    jmp  .blk
+.blk_end:
+    lea  rsi, [rcx + 3]
+    jmp  skip_blank_lines
+.line:                          ; a # comment: to the end of the line
+    cmp  rsi, r12
+    jae  .r
+    cmp  byte [rsi], 0x0A
+    je   skip_blank_lines
+    inc  rsi
+    jmp  .line
+.next:
+    inc  rsi
+    jmp  skip_blank_lines
+.r: ret
 
 ; RAX = the record of a built-in function: remember that a mem. function is in use
 note_builtin:

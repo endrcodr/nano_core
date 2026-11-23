@@ -1543,6 +1543,8 @@ out_end:                        ; footer, runtime helpers, then write the file
     ; fall through
 
 out_flush:
+    cmp  byte [run_flag], 0
+    jne  interp_run             ; --run: assemble in memory and run instead of writing the file
     sub  rsp, 40                ; entry rsp is 8 mod 16: keeps the calls aligned
     call build_out_path
     lea  rcx, [out_path]
