@@ -4,8 +4,10 @@ Nano is a coding language designed to be simple, straightforward, and easily rea
 Start by learning the basics of Python. This language was built primarily on the Python language, and many scripts that work in Python will work in Nano, as long as it doesn't involve any extensions that haven't yet been ported to Nano. Nano is a lower-level language, however, and studying Nano-specific syntax is never a bad idea.
 
 # Requirements:
-NASM assembler, and a computer running Windows 11. We hope to soon come out with our own OS with this compiler built-in.
-Linux compatibility is currently experimental.
+NASM assembler, and a computer running Windows 11 or Linux. We hope to soon come out with our own OS with this compiler built-in.
 We are also working on creating a full, preassembled release in the alpha stage, with the basic functionality a coding language needs. You will soon be able to download a functional executable directly, making it easier for users to get a working compiler.
+
+# Targets:
+We target compiled code with compiled speed matching or beating that of compiled C or Rust, as well as interpreted code being only slightly behind.
 
 *The code for the Nano Project has been coded for humans, by humans. Suggestions containing convoluted, obfuscated, or otherwise hidden or overly complex code will not be considered for the main branch. AI-generated code is not allowed unless tested and reviewed by an experienced human.*
