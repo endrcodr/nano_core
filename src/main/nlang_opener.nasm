@@ -15,7 +15,8 @@ section .bss
     path_buf    resb PATH_MAX
     verbose     resb 1              ; 1 with -v / --verbose: show every statement
     run_flag    resb 1              ; 1 with -r / --run: assemble in memory and run, write no .nasm
-    resb 6
+    no_opt      resb 1              ; 1 with --no-opt / -O0: leave the generated code as it is
+    resb 5
     buffer      resb BUFFER_SIZE
 
 section .text
@@ -90,7 +91,7 @@ main_opener:
     jmp  .skip_spaces
 .not_run:
     cmp  dword [rsi], '--ve'
-    jne  .try_win
+    jne  .try_noopt
     cmp  dword [rsi + 4], 'rbos'
     jne  .path
     cmp  byte [rsi + 8], 'e'
@@ -104,6 +105,30 @@ main_opener:
     jne  .path                  ; e.g. "-vx": just a (bad) file name
 .set_verbose:
     mov  byte [verbose], 1
+    add  rsi, rcx
+    jmp  .skip_spaces
+.try_noopt:                     ; --no-opt  or  -O0
+    cmp  dword [rsi], '--no'
+    jne  .try_o0
+    cmp  dword [rsi + 4], '-opt'
+    jne  .path
+    movzx eax, byte [rsi + 8]
+    mov  ecx, 8
+    jmp  .noopt_end
+.try_o0:
+    cmp  word [rsi], '-O'
+    jne  .try_win
+    cmp  byte [rsi + 2], '0'
+    jne  .path
+    movzx eax, byte [rsi + 3]
+    mov  ecx, 3
+.noopt_end:
+    test al, al
+    jz   .set_noopt
+    cmp  al, ' '
+    jne  .path
+.set_noopt:
+    mov  byte [no_opt], 1
     add  rsi, rcx
     jmp  .skip_spaces
 .try_win:                       ; --win64
