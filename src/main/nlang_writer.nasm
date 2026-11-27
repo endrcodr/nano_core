@@ -1672,9 +1672,15 @@ peephole:
     push r13
     push r14
     push r15
+    call fp_pass                ; def frames inline (pass 0, see below)
     mov  byte [pp_mode], 1
     call pp_pass
     mov  byte [pp_mode], 2
+    call pp_pass
+    call rg_pass                ; hot variables into R12-R15 (pass 3, see below)
+    mov  byte [pp_mode], 1
+    call pp_pass                ; pass 1 again: it now sees  mov rax, r12  ...
+    mov  byte [pp_mode], 3
     call pp_pass
     pop  r15
     pop  r14
@@ -1698,6 +1704,8 @@ pp_pass:                        ; out_buf -> opt_buf -> back into out_buf (uncha
     cmp  r15, r12
     jae  .abort
     mov  r8, r13
+    cmp  byte [pp_mode], 3
+    je   .mode3
     cmp  byte [pp_mode], 1
     jne  .mode2
     ; ---- pass 1
@@ -1770,6 +1778,38 @@ pp_pass:                        ; out_buf -> opt_buf -> back into out_buf (uncha
     PP_LIT pp_nl
     jz   .copy
     mov  rsi, r13               ; keep the store, drop the reload
+    mov  rcx, [pp_e1]
+    sub  rcx, r13
+    call pp_put
+    mov  r13, r8
+    jmp  .line
+    ; ---- pass 4:  mov rN, rax / mov rax, rN   ->  the store only   (N = 12..15)
+.mode3:
+    PP_LIT rg_t_mov_r1
+    jz   .copy
+    cmp  r8, r14
+    jae  .copy
+    movzx eax, byte [r8]
+    cmp  al, '2'
+    jb   .copy
+    cmp  al, '5'
+    ja   .copy
+    mov  [pp_k], rax
+    inc  r8
+    PP_LIT pp_comma_rax
+    jz   .copy
+    mov  [pp_e1], r8
+    PP_LIT rg_t_rax_r1
+    jz   .copy
+    cmp  r8, r14
+    jae  .copy
+    movzx eax, byte [r8]
+    cmp  rax, [pp_k]
+    jne  .copy
+    inc  r8
+    PP_LIT pp_nl
+    jz   .copy
+    mov  rsi, r13
     mov  rcx, [pp_e1]
     sub  rcx, r13
     call pp_put
@@ -1888,6 +1928,8 @@ pp_operand:
     jae  .no
     mov  r9, r8
     movzx eax, byte [r8]
+    cmp  al, 'r'
+    je   .reg
     cmp  al, '['
     jne  .imm
     lea  r10, [r8 + 1]
@@ -1928,6 +1970,25 @@ pp_operand:
     inc  r10
     mov  r8, r10
     mov  r11d, 1
+    mov  eax, 1
+    ret
+.reg:                           ; r12 .. r15 (only there once pass 3 has put variables into them)
+    lea  rax, [r8 + 4]
+    cmp  rax, r14
+    ja   .no
+    cmp  byte [r8 + 1], '1'
+    jne  .no
+    movzx eax, byte [r8 + 2]
+    cmp  al, '2'
+    jb   .no
+    cmp  al, '5'
+    ja   .no
+    movzx eax, byte [r8 + 3]
+    call rg_tokchar
+    jnz  .no
+    add  r8, 3
+    mov  r10, r8
+    mov  r11d, 2
     mov  eax, 1
     ret
 .imm:
@@ -2141,6 +2202,1112 @@ pp_magic:
 .done:
     lea  rax, [r10 + 1]
     sub  ecx, 64
+    ret
+
+
+; ---- keeping hot variables in registers --------------------------------------------------------------------------
+; Pass 3 of the optimizer.  Up to four plain variables (resq 1, not def locals) live in R12-R15 for the whole program instead of in
+; memory.  A variable qualifies only when EVERY mention of it in the program text is one of these seven line shapes
+;     mov REG, [v]   mov [v], rax   inc/dec qword [v]   add/sub [v], rax   mov qword [v], number
+; so nothing takes its address (lea), indexes it, copies it in a block or reads it with another width.  Variables of a def are left out
+; (their memory is saved and restored in blocks by the recursion code), and so is everything when the program text mentions R12-R15
+; anywhere (the generated code and the runtime helpers never do: they keep those registers, and so do the system calls and the Windows
+; API).  The registers go to the variables with the most uses, uses inside loops counting 8 times per loop level.  The start of the
+; program gets  xor r12d, r12d ...  because a variable starts out as 0.  Anything unexpected: the program text stays as it is.
+section .data
+STR rg_inc,   `    inc  qword `
+STR rg_dec,   `    dec  qword `
+STR rg_add,   `    add  `
+STR rg_sub,   `    sub  `
+STR rg_o_inc, `    inc  `
+STR rg_o_dec, `    dec  `
+STR rg_qword, `qword `
+STR rg_csp,   `, `
+STR rg_decl,  `resq 1`
+STR rg_lp,    `lp_`
+STR rg_top,   `_top:\n`
+STR rg_top2,  `_top\n`
+STR rg_jlp,   `    jmp  lp_`
+STR rg_entA,  `_start:\n`
+STR rg_entB,  `main:\n`
+STR rg_sub40, `    sub  rsp, 40\n`
+STR rg_xor12, `    xor  r12d, r12d\n`
+STR rg_xor13, `    xor  r13d, r13d\n`
+STR rg_xor14, `    xor  r14d, r14d\n`
+STR rg_xor15, `    xor  r15d, r15d\n`
+STR rg_s_r12, `r12`
+STR rg_s_r13, `r13`
+STR rg_s_r14, `r14`
+STR rg_s_r15, `r15`
+STR rg_m0, `    mov  rax, `
+STR rg_m1, `    mov  rbx, `
+STR rg_m2, `    mov  rcx, `
+STR rg_m3, `    mov  rdx, `
+STR rg_m4, `    mov  rsi, `
+STR rg_m5, `    mov  rdi, `
+STR rg_m6, `    mov  r8, `
+STR rg_m7, `    mov  r9, `
+STR rg_m8, `    mov  r10, `
+STR rg_m9, `    mov  r11, `
+STR rg_t_mov_r1, `    mov  r1`
+STR rg_t_rax_r1, `    mov  rax, r1`
+section .bss
+RG_MAX equ 256
+    rg_tab    resb RG_MAX * 32      ; +0 name pointer, +8 length, +16 uses (weighted), +24 disqualified, +25 register (1..4, 0 none)
+    rg_cnt    resd 1
+    rg_depth  resd 1
+    rg_form   resd 1                ; 0 none, 1 mov REG,[v]  2 mov [v],rax  3 inc  4 dec  5 add  6 sub  7 mov qword [v],number
+    rg_nptr   resq 1                ; the name in [name]
+    rg_nlen   resq 1
+    rg_is     resq 1                ; form 7: the number
+    rg_ie     resq 1
+    rg_next   resq 1                ; the start of the next line
+    rg_entry  resb 1
+    rg_nsel   resd 1
+    rg_k      resd 1
+section .text
+
+%macro RGM 1
+    PP_LIT %1
+    jnz  .regok
+%endmacro
+
+; rg_tokchar: AL -> ZF = 0 when it can be part of a name  [A-Za-z0-9_@.$]
+rg_tokchar:
+    cmp  al, '_'
+    je   .y
+    cmp  al, '@'
+    je   .y
+    cmp  al, '.'
+    je   .y
+    cmp  al, '$'
+    je   .y
+    cmp  al, '0'
+    jb   .n
+    cmp  al, '9'
+    jbe  .y
+    cmp  al, 'A'
+    jb   .n
+    cmp  al, 'Z'
+    jbe  .y
+    cmp  al, 'a'
+    jb   .n
+    cmp  al, 'z'
+    ja   .n
+.y: or   al, al                     ; (ZF = 0 for every character used here: none of them is 0)
+    ret
+.n: xor  eax, eax                   ; ZF = 1
+    ret
+
+; RSI = name, ECX = length -> RAX = the entry in rg_tab or 0
+rg_find:
+    lea  rax, [rg_tab]
+    mov  edx, [rg_cnt]
+.l: test edx, edx
+    jz   .no
+    cmp  rcx, [rax + 8]
+    jne  .nx
+    push rsi
+    push rdi
+    push rcx
+    mov  rdi, [rax]
+    repe cmpsb
+    pop  rcx
+    pop  rdi
+    pop  rsi
+    je   .r
+.nx:
+    add  rax, 32
+    dec  edx
+    jmp  .l
+.no:
+    xor  eax, eax
+.r: ret
+
+; a line  name:  resq 1  at R8 -> EAX = 1, R9 = name, R10 = its length, R8 = the start of the next line.   Else EAX = 0.
+rg_parse_decl:
+    mov  r9, r8
+.t: cmp  r8, r14
+    jae  .no
+    movzx eax, byte [r8]
+    call rg_tokchar
+    jz   .colon
+    inc  r8
+    jmp  .t
+.colon:
+    mov  r10, r8
+    sub  r10, r9
+    jz   .no
+    cmp  byte [r8], ':'
+    jne  .no
+    inc  r8
+    cmp  r8, r14
+    jae  .no
+    cmp  byte [r8], ' '
+    jne  .no
+.sp:
+    cmp  r8, r14
+    jae  .no
+    cmp  byte [r8], ' '
+    jne  .rq
+    inc  r8
+    jmp  .sp
+.rq:
+    push r9
+    push r10
+    PP_LIT rg_decl
+    pop  r10
+    pop  r9
+    jz   .no
+.eol:
+    cmp  r8, r14
+    jae  .end
+    mov  al, [r8]
+    inc  r8
+    cmp  al, ' '
+    je   .eol
+    cmp  al, 10
+    je   .end
+    jmp  .no
+.end:
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
+; the line at R13 as one of the seven shapes -> [rg_form] (0 = none), [rg_nptr] / [rg_nlen] = the variable's name, [rg_next] = the next line
+rg_parse_form:
+    mov  dword [rg_form], 0
+    mov  r8, r13
+    PP_LIT rg_inc
+    jz   .n1
+    mov  esi, 3
+    jmp  .oper_nl
+.n1:
+    PP_LIT rg_dec
+    jz   .n2
+    mov  esi, 4
+    jmp  .oper_nl
+.n2:
+    PP_LIT rg_add
+    jz   .n3
+    mov  esi, 5
+    jmp  .oper_rax
+.n3:
+    PP_LIT rg_sub
+    jz   .n4
+    mov  esi, 6
+    jmp  .oper_rax
+.n4:
+    PP_LIT pp_mov
+    jz   .none
+    cmp  r8, r14
+    jae  .none
+    cmp  byte [r8], '['
+    je   .store
+    PP_LIT rg_qword
+    jnz  .imm
+    ; mov REG, [v]: REG is one of ten 64-bit registers (r8 is the cursor after "    mov  ")
+    sub  r8, pp_mov_len         ; back to the start of "    mov  " to match the whole prefix
+    RGM rg_m0
+    RGM rg_m1
+    RGM rg_m2
+    RGM rg_m3
+    RGM rg_m4
+    RGM rg_m5
+    RGM rg_m6
+    RGM rg_m7
+    RGM rg_m8
+    RGM rg_m9
+    jmp  .none
+.regok:
+    mov  [rg_is], r8            ; (the end of "    mov  REG, ")
+    mov  esi, 1
+    jmp  .oper_nl
+.store:
+    mov  esi, 2
+    jmp  .oper_rax
+.imm:
+    PP_OPERAND                  ; mov qword [v], number
+    jz   .none
+    cmp  r11d, 1
+    jne  .none
+    lea  rax, [r9 + 1]
+    mov  [rg_nptr], rax
+    lea  rax, [r10 - 1]
+    sub  rax, [rg_nptr]
+    mov  [rg_nlen], rax
+    PP_LIT rg_csp
+    jz   .none
+    mov  [rg_is], r8
+    cmp  r8, r14
+    jae  .none
+    cmp  byte [r8], '-'
+    jne  .dg
+    inc  r8
+.dg:
+    xor  ecx, ecx
+.dl:
+    cmp  r8, r14
+    jae  .none
+    movzx eax, byte [r8]
+    sub  eax, '0'
+    cmp  eax, 9
+    ja   .dend
+    inc  r8
+    inc  ecx
+    jmp  .dl
+.dend:
+    cmp  ecx, 1
+    jb   .none
+    cmp  ecx, 9
+    ja   .none                  ; (so the number fits in 32 bits)
+    mov  [rg_ie], r8
+    PP_LIT pp_nl
+    jz   .none
+    mov  esi, 7
+    jmp  .done
+.oper_rax:                      ; [v], rax
+    PP_OPERAND
+    jz   .none
+    cmp  r11d, 1
+    jne  .none
+    mov  [rg_form], esi
+    call .setname
+    PP_LIT pp_comma_rax
+    jz   .none
+    jmp  .done2
+.oper_nl:                       ; [v] then the end of the line (inc, dec and  mov REG, [v])
+    PP_OPERAND
+    jz   .none
+    cmp  r11d, 1
+    jne  .none
+    mov  [rg_form], esi
+    call .setname
+    PP_LIT pp_nl
+    jz   .none
+    jmp  .done2
+.done:
+    mov  [rg_form], esi
+.done2:
+    mov  [rg_next], r8
+    ret
+.setname:
+    lea  rax, [r9 + 1]
+    mov  [rg_nptr], rax
+    lea  rax, [r10 - 1]
+    sub  rax, [rg_nptr]
+    mov  [rg_nlen], rax
+    ret
+.none:
+    mov  dword [rg_form], 0
+    ret
+
+; EAX = 1..4: append  r12 .. r15
+rg_put_reg:
+    cmp  eax, 2
+    jb   .a
+    je   .b
+    cmp  eax, 3
+    je   .c
+    PP_PUT rg_s_r15
+    ret
+.a: PP_PUT rg_s_r12
+    ret
+.b: PP_PUT rg_s_r13
+    ret
+.c: PP_PUT rg_s_r14
+    ret
+
+; EAX = 1..4: append  xor rNd, rNd
+rg_put_xor:
+    cmp  eax, 2
+    jb   .a
+    je   .b
+    cmp  eax, 3
+    je   .c
+    PP_PUT rg_xor15
+    ret
+.a: PP_PUT rg_xor12
+    ret
+.b: PP_PUT rg_xor13
+    ret
+.c: PP_PUT rg_xor14
+    ret
+
+; EAX = 1 when the program text never mentions R12-R15 (comments after ';' do not count)
+rg_regs_free:
+    lea  r8, [out_buf]
+    xor  ecx, ecx               ; 1 inside a comment
+    xor  r10d, r10d             ; the quote character we are inside, or 0
+    mov  r9b, 0                 ; the character before
+.l: cmp  r8, r14
+    jae  .yes
+    movzx eax, byte [r8]
+    cmp  al, 10
+    jne  .nl
+    xor  ecx, ecx
+    xor  r10d, r10d
+    jmp  .adv
+.nl:
+    test ecx, ecx
+    jnz  .adv
+    test r10d, r10d
+    jz   .noq
+    cmp  eax, r10d
+    jne  .adv
+    xor  r10d, r10d
+    jmp  .adv
+.noq:
+    cmp  al, "'"
+    je   .q
+    cmp  al, '"'
+    je   .q
+    cmp  al, ';'
+    jne  .nc
+    mov  ecx, 1
+    jmp  .adv
+.q: mov  r10d, eax
+    jmp  .adv
+.nc:
+    cmp  al, 'r'
+    jne  .adv
+    movzx eax, r9b              ; 'r' must start a name
+    call rg_tokchar
+    jnz  .adv
+    lea  rax, [r8 + 4]
+    cmp  rax, r14
+    ja   .adv
+    cmp  byte [r8 + 1], '1'
+    jne  .adv
+    movzx eax, byte [r8 + 2]
+    cmp  al, '2'
+    jb   .adv
+    cmp  al, '5'
+    ja   .adv
+    movzx eax, byte [r8 + 3]    ; ... and end there, or after a d / w / b
+    call rg_tokchar
+    jnz  .suf
+    jmp  .no
+.suf:
+    movzx eax, byte [r8 + 3]
+    cmp  al, 'd'
+    je   .s2
+    cmp  al, 'w'
+    je   .s2
+    cmp  al, 'b'
+    jne  .adv
+.s2:
+    movzx eax, byte [r8 + 4]
+    call rg_tokchar
+    jz   .no
+.adv:
+    movzx eax, byte [r8]
+    mov  r9b, al
+    inc  r8
+    jmp  .l
+.yes:
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
+; the start of the next line: R8 = a place in a line -> R8 = the first byte of the next one (or the end of the text)
+rg_nextline:
+.l: cmp  r8, r14
+    jae  .r
+    cmp  byte [r8], 10
+    lea  r8, [r8 + 1]
+    jne  .l
+.r: ret
+
+; every name on the line at R13 that is in rg_tab is disqualified (the line is not one of the seven shapes); R13 moves to the next line
+rg_scan_tokens:
+    mov  r8, r13
+    xor  r11d, r11d             ; the quote character we are inside, or 0
+.tl:
+    cmp  r8, r14
+    jae  .end
+    movzx eax, byte [r8]
+    cmp  al, 10
+    je   .eol
+    test r11d, r11d
+    jz   .noq
+    cmp  eax, r11d
+    jne  .skip1
+    xor  r11d, r11d
+    jmp  .skip1
+.noq:
+    cmp  al, "'"
+    je   .q
+    cmp  al, '"'
+    je   .q
+    cmp  al, ';'
+    je   .comment
+    call rg_tokchar
+    jz   .skip1
+    mov  r9, r8                 ; a name starts here
+.tk:
+    inc  r8
+    cmp  r8, r14
+    jae  .look
+    movzx eax, byte [r8]
+    call rg_tokchar
+    jnz  .tk
+.look:
+    mov  rsi, r9
+    mov  rcx, r8
+    sub  rcx, r9
+    push r11
+    call rg_find
+    pop  r11
+    test rax, rax
+    jz   .tl
+    mov  byte [rax + 24], 1
+    jmp  .tl
+.q:
+    mov  r11d, eax
+.skip1:
+    inc  r8
+    jmp  .tl
+.comment:
+    cmp  r8, r14
+    jae  .end
+    cmp  byte [r8], 10
+    je   .eol
+    inc  r8
+    jmp  .comment
+.eol:
+    inc  r8
+.end:
+    mov  r13, r8
+    ret
+
+rg_pass:
+    lea  r13, [out_buf]
+    mov  r14, r13
+    add  r14, [out_len]
+    call rg_regs_free
+    test eax, eax
+    jz   .ret
+    ; ---- 1. the plain one-qword variables
+    mov  dword [rg_cnt], 0
+    lea  r13, [out_buf]
+.d1:
+    cmp  r13, r14
+    jae  .d1done
+    mov  r8, r13
+    call rg_parse_decl
+    test eax, eax
+    jz   .d1skip
+    mov  r13, r8
+    cmp  dword [rg_cnt], RG_MAX
+    jae  .d1
+    mov  rsi, r9                ; names with an @ belong to a def: not allowed
+    mov  rcx, r10
+.at:
+    cmp  byte [rsi], '@'
+    je   .d1
+    inc  rsi
+    dec  rcx
+    jnz  .at
+    mov  eax, [rg_cnt]
+    shl  eax, 5
+    lea  rdx, [rg_tab + rax]
+    mov  [rdx], r9
+    mov  [rdx + 8], r10
+    mov  qword [rdx + 16], 0
+    mov  qword [rdx + 24], 0
+    inc  dword [rg_cnt]
+    jmp  .d1
+.d1skip:
+    mov  r8, r13
+    call rg_nextline
+    mov  r13, r8
+    jmp  .d1
+.d1done:
+    cmp  dword [rg_cnt], 0
+    je   .ret
+    ; ---- 2. how often, and in what way, each one is used
+    mov  dword [rg_depth], 0
+    lea  r13, [out_buf]
+.u:
+    cmp  r13, r14
+    jae  .udone
+    mov  r8, r13                ; loops: lp_N_top: opens one, jmp lp_N_top closes it
+    PP_LIT rg_lp
+    jz   .nolp
+    call rg_nextline            ; (R8 = after the newline)
+    lea  r8, [r8 - 6]
+    PP_LIT rg_top
+    jz   .nolp
+    cmp  dword [rg_depth], 6
+    jae  .nolp
+    inc  dword [rg_depth]
+    jmp  .classify
+.nolp:
+    mov  r8, r13
+    PP_LIT rg_jlp
+    jz   .classify
+    call rg_nextline
+    lea  r8, [r8 - 5]
+    PP_LIT rg_top2
+    jz   .classify
+    cmp  dword [rg_depth], 0
+    je   .classify
+    dec  dword [rg_depth]
+.classify:
+    call rg_parse_form
+    cmp  dword [rg_form], 0
+    je   .notform
+    mov  rsi, [rg_nptr]
+    mov  rcx, [rg_nlen]
+    call rg_find
+    test rax, rax
+    jz   .formdone
+    mov  ecx, [rg_depth]
+    lea  ecx, [rcx + rcx * 2]   ; 8 times more per loop level
+    mov  edx, 1
+    shl  edx, cl
+    add  [rax + 16], rdx
+.formdone:
+    mov  r13, [rg_next]
+    jmp  .u
+.notform:
+    mov  r8, r13
+    call rg_parse_decl
+    test eax, eax
+    jz   .tokens
+    mov  r13, r8
+    jmp  .u
+.tokens:
+    call rg_scan_tokens
+    jmp  .u
+.udone:
+    ; ---- 3. the four most used ones that qualify (used inside a loop)
+    xor  ebx, ebx
+.pick:
+    cmp  ebx, 4
+    jae  .picked
+    xor  r9d, r9d
+    mov  r10d, 7                ; at least 8
+    lea  rax, [rg_tab]
+    mov  edx, [rg_cnt]
+.bl:
+    test edx, edx
+    jz   .bd
+    cmp  byte [rax + 24], 0
+    jne  .bn
+    cmp  byte [rax + 25], 0
+    jne  .bn
+    cmp  [rax + 16], r10
+    jbe  .bn
+    mov  r10, [rax + 16]
+    mov  r9, rax
+.bn:
+    add  rax, 32
+    dec  edx
+    jmp  .bl
+.bd:
+    test r9, r9
+    jz   .picked
+    inc  ebx
+    mov  [r9 + 25], bl
+    jmp  .pick
+.picked:
+    mov  [rg_nsel], ebx
+    test ebx, ebx
+    jz   .ret
+    ; ---- 4. rewrite
+    mov  byte [rg_entry], 0
+    lea  r13, [out_buf]
+    lea  r15, [opt_buf]
+    lea  r12, [opt_buf + OUT_SIZE - 4096]
+.rw:
+    cmp  r13, r14
+    jae  .rwdone
+    cmp  r15, r12
+    jae  .ret
+    mov  r8, r13
+    PP_LIT rg_entA
+    jnz  .entry
+    PP_LIT rg_entB
+    jz   .notentry
+.entry:
+    PP_LIT rg_sub40
+    jz   .notentry
+    mov  rsi, r13               ; the label and  sub rsp, 40  as they are, then the zeroing
+    mov  rcx, r8
+    sub  rcx, r13
+    call pp_put
+    mov  [rg_next], r8
+    mov  ebx, 1
+.xl:
+    cmp  ebx, [rg_nsel]
+    ja   .xd
+    mov  eax, ebx
+    call rg_put_xor
+    inc  ebx
+    jmp  .xl
+.xd:
+    mov  byte [rg_entry], 1
+    mov  r13, [rg_next]
+    jmp  .rw
+.notentry:
+    call rg_parse_form
+    cmp  dword [rg_form], 0
+    je   .copy
+    mov  rsi, [rg_nptr]
+    mov  rcx, [rg_nlen]
+    call rg_find
+    test rax, rax
+    jz   .copy
+    movzx eax, byte [rax + 25]
+    test eax, eax
+    jz   .copy
+    mov  [rg_k], eax
+    mov  eax, [rg_form]
+    cmp  eax, 1
+    je   .f1
+    cmp  eax, 2
+    je   .f2
+    cmp  eax, 3
+    je   .f3
+    cmp  eax, 4
+    je   .f4
+    cmp  eax, 5
+    je   .f5
+    cmp  eax, 6
+    je   .f6
+    ; 7: mov qword [v], number  ->  mov rN, number
+    PP_PUT pp_mov
+    mov  eax, [rg_k]
+    call rg_put_reg
+    PP_PUT rg_csp
+    PP_PUTSPAN rg_is, rg_ie
+    PP_PUT pp_nl
+    jmp  .fdone
+.f1:                            ; mov REG, [v]  ->  mov REG, rN
+    mov  rsi, r13
+    mov  rcx, [rg_is]
+    sub  rcx, r13
+    call pp_put
+    mov  eax, [rg_k]
+    call rg_put_reg
+    PP_PUT pp_nl
+    jmp  .fdone
+.f2:                            ; mov [v], rax  ->  mov rN, rax
+    PP_PUT pp_mov
+    mov  eax, [rg_k]
+    call rg_put_reg
+    PP_PUT pp_comma_rax
+    jmp  .fdone
+.f3:
+    PP_PUT rg_o_inc
+    jmp  .f34
+.f4:
+    PP_PUT rg_o_dec
+.f34:
+    mov  eax, [rg_k]
+    call rg_put_reg
+    PP_PUT pp_nl
+    jmp  .fdone
+.f5:
+    PP_PUT rg_add
+    jmp  .f56
+.f6:
+    PP_PUT rg_sub
+.f56:
+    mov  eax, [rg_k]
+    call rg_put_reg
+    PP_PUT pp_comma_rax
+.fdone:
+    mov  r13, [rg_next]
+    jmp  .rw
+.copy:
+    mov  al, [r13]
+    mov  [r15], al
+    inc  r13
+    inc  r15
+    cmp  al, 10
+    je   .rw
+    cmp  r13, r14
+    jb   .copy
+    jmp  .rw
+.rwdone:
+    cmp  byte [rg_entry], 0
+    je   .ret                   ; no place for the zeroing: leave everything as it is
+    lea  rsi, [opt_buf]
+    mov  rcx, r15
+    sub  rcx, rsi
+    mov  [out_len], rcx
+    lea  rdi, [out_buf]
+    rep  movsb
+.ret:
+    ret
+
+; ---- def frames, inline ---------------------------------------------------------------------------------------------
+; Pass 0 of the optimizer (runs first).  A call of a def that is already running saves the def's variables with two calls of
+; rt_frame_save (one for the .bss part, one for the .data part) and restores them with two calls of rt_frame_restore, each a
+; "rep movsb" plus bookkeeping.  When the def's variables are all  resq  items in .bss and it has nothing in .data (the usual case),
+; the number K of qwords is known from the text, and those calls become K loads and K stores each, straight to and from the same
+; save area (rt_svbuf / rt_svp), in the same last-in-first-out order.  The save area gets no 16-byte header for these: the matching
+; restore takes exactly 8*K bytes back.  The overflow check (error 0x205) stays.  Any def that doesn't fit the rule is left alone.
+; Table fp_tab: per def number the K (0-16), or 0xFF for "leave it".
+section .data
+STR fp_sec,    `section .`
+STR fp_cmpfa,  `    cmp  qword [fa_`
+STR fp_leab,   `    lea  rsi, [fr_`
+STR fp_bclose, `_b]\n`
+STR fp_dclose, `_d]\n`
+STR fp_movecx, `    mov  ecx, fr_`
+STR fp_callsv, `    call rt_frame_save\n`
+STR fp_callrs, `    call rt_frame_restore\n`
+STR fp_fr,     `fr_`
+STR fp_lb,     `_b:\n`
+STR fp_lbe,    `_be:\n`
+STR fp_resq,   `resq`
+STR fp_s1a,    `    mov  r8, [rt_svp]\n    lea  r9, [r8 + `
+STR fp_s1b,    `]\n    cmp  r9, SV_CAP\n    ja   rt_err_deep\n    lea  rdx, [rt_svbuf]\n    add  rdx, r8\n    mov  [rt_svp], r9\n`
+STR fp_s2a,    `    mov  rcx, [fr_`
+STR fp_s2b,    `_b + `
+STR fp_s2c,    `]\n    mov  [rdx + `
+STR fp_s2d,    `], rcx\n`
+STR fp_r1a,    `    mov  r8, [rt_svp]\n    sub  r8, `
+STR fp_r1b,    `\n    mov  [rt_svp], r8\n    lea  rdx, [rt_svbuf]\n    add  rdx, r8\n`
+STR fp_r2a,    `    mov  rcx, [rdx + `
+STR fp_r2b,    `]\n    mov  [fr_`
+STR fp_r2d,    `], rcx\n`
+section .bss
+    fp_tab    resb 256
+    fp_curn   resq 1
+    fp_saved  resq 1
+    fp_n      resq 1
+    fp_k      resq 1
+    fp_i      resq 1
+    fp_cnt    resq 1
+    fp_regn   resq 1
+    fp_sect   resd 1
+    fp_ok     resb 1
+    fp_in     resb 1
+    fp_mode   resb 1
+section .text
+
+; the lines of the text; R8 = cursor at a line start, R14 = end.  EAX = 1 when the literal at R8 matches (R8 moves past it)
+; (uses pp_lit through PP_LIT)
+
+; EAX = 1: the line at R13 is label-only, blank or a comment, or (bss) "name: resq N" (N added to fp_cnt); EAX = 0: anything else
+fp_classify:
+    mov  r8, r13
+    cmp  r8, r14
+    jae  .ok
+    cmp  byte [r8], 10
+    je   .ok
+    cmp  byte [r8], ';'
+    je   .ok
+.name:
+    cmp  r8, r14
+    jae  .bad
+    movzx eax, byte [r8]
+    cmp  al, 10
+    je   .bad
+    cmp  al, ' '
+    je   .bad
+    inc  r8
+    cmp  al, ':'
+    jne  .name
+.sp:
+    cmp  r8, r14
+    jae  .ok
+    cmp  byte [r8], ' '
+    jne  .after
+    inc  r8
+    jmp  .sp
+.after:
+    cmp  byte [r8], 10
+    je   .ok                    ; just a label
+    cmp  dword [fp_sect], 1
+    jne  .bad
+    PP_LIT fp_resq
+    jz   .bad
+.sp2:
+    cmp  r8, r14
+    jae  .bad
+    cmp  byte [r8], ' '
+    jne  .num
+    inc  r8
+    jmp  .sp2
+.num:
+    call pp_decimal
+    test eax, eax
+    jz   .bad
+    cmp  r8, r14
+    jae  .bad
+    cmp  byte [r8], 10
+    jne  .bad
+    mov  rax, [pp_k]
+    cmp  rax, 16
+    ja   .bad
+    add  [fp_cnt], rax
+    jmp  .ok
+.bad:
+    xor  eax, eax
+    ret
+.ok:
+    mov  eax, 1
+    ret
+
+; fp_pass: scan 1 fills fp_tab, scan 2 rewrites the call sites
+fp_pass:
+    lea  rdi, [fp_tab]
+    mov  ecx, 256
+    mov  al, 0xFF
+    rep  stosb
+    mov  byte [fp_in], 0
+    mov  dword [fp_sect], 0
+    lea  r13, [out_buf]
+    mov  r14, r13
+    add  r14, [out_len]
+.s1:
+    cmp  r13, r14
+    jae  .scan2
+    mov  r8, r13
+    PP_LIT fp_sec
+    jz   .notsec
+    mov  dword [fp_sect], 0
+    cmp  byte [r8], 'b'
+    jne  .s_d
+    mov  dword [fp_sect], 1
+.s_d:
+    cmp  byte [r8], 'd'
+    jne  .s1next
+    mov  dword [fp_sect], 2
+    jmp  .s1next
+.notsec:
+    mov  r8, r13
+    PP_LIT fp_fr
+    jz   .notfr
+    call pp_decimal
+    test eax, eax
+    jz   .notfr
+    mov  rax, [pp_k]
+    cmp  rax, 255
+    ja   .notfr
+    mov  [fp_n], rax
+    PP_LIT fp_lb
+    jz   .try_be
+    mov  rax, [fp_n]
+    mov  [fp_regn], rax
+    mov  byte [fp_in], 1
+    mov  byte [fp_ok], 1
+    mov  qword [fp_cnt], 0
+    jmp  .s1next
+.try_be:
+    mov  r8, r13
+    PP_LIT fp_fr
+    call pp_decimal
+    PP_LIT fp_lbe
+    jz   .notfr
+    cmp  byte [fp_in], 0
+    je   .s1next
+    mov  rax, [fp_n]
+    cmp  rax, [fp_regn]
+    jne  .s1next
+    mov  byte [fp_in], 0
+    cmp  byte [fp_ok], 0
+    je   .s1next
+    lea  rdx, [fp_tab]
+    mov  rcx, [fp_cnt]
+    cmp  rcx, 16
+    ja   .s1next
+    mov  [rdx + rax], cl
+    jmp  .s1next
+.notfr:
+    cmp  byte [fp_in], 0
+    je   .s1next
+    cmp  dword [fp_sect], 0
+    je   .s1next
+    call fp_classify
+    test eax, eax
+    jnz  .s1next
+    mov  byte [fp_ok], 0
+.s1next:
+    mov  r8, r13
+    call rg_nextline
+    mov  r13, r8
+    jmp  .s1
+
+    ; ---- scan 2
+.scan2:
+    mov  qword [fp_curn], -1
+    mov  qword [fp_saved], -1
+    lea  r13, [out_buf]
+    lea  r15, [opt_buf]
+    lea  r12, [opt_buf + OUT_SIZE - 4096]
+.line:
+    cmp  r13, r14
+    jae  .finish
+    cmp  r15, r12
+    jae  .abort
+    mov  r8, r13
+    PP_LIT fp_cmpfa
+    jz   .t_lea
+    call pp_decimal
+    test eax, eax
+    jz   .copy
+    mov  rax, [pp_k]
+    mov  [fp_curn], rax
+    jmp  .copy
+.t_lea:
+    mov  r8, r13
+    PP_LIT fp_leab
+    jz   .t_rs
+    call pp_decimal
+    test eax, eax
+    jz   .copy
+    mov  rax, [pp_k]
+    cmp  rax, [fp_curn]
+    jne  .copy
+    cmp  rax, 255
+    ja   .copy
+    mov  [fp_n], rax
+    lea  rdx, [fp_tab]
+    movzx ecx, byte [rdx + rax]
+    cmp  ecx, 0xFF
+    je   .copy
+    mov  [fp_k], rcx
+    PP_LIT fp_bclose
+    jz   .copy
+    PP_LIT fp_movecx
+    jz   .copy
+    call rg_nextline
+    PP_LIT fp_callsv
+    jz   .copy
+    PP_LIT fp_leab
+    jz   .copy
+    call pp_decimal
+    test eax, eax
+    jz   .copy
+    mov  rax, [pp_k]
+    cmp  rax, [fp_n]
+    jne  .copy
+    PP_LIT fp_dclose
+    jz   .copy
+    PP_LIT fp_movecx
+    jz   .copy
+    call rg_nextline
+    PP_LIT fp_callsv
+    jz   .copy
+    mov  rax, [fp_n]
+    mov  [fp_saved], rax
+    mov  [pp_e2], r8
+    cmp  qword [fp_k], 0
+    je   .skipemit
+    mov  byte [fp_mode], 0
+    call fp_emit
+.skipemit:
+    mov  r13, [pp_e2]
+    jmp  .line
+.t_rs:
+    mov  r8, r13
+    PP_LIT fp_callrs
+    jz   .copy
+    PP_LIT fp_callrs
+    jz   .copy
+    mov  rax, [fp_curn]
+    cmp  rax, 255
+    ja   .copy
+    cmp  rax, [fp_saved]
+    jne  .copy
+    mov  [fp_n], rax
+    lea  rdx, [fp_tab]
+    movzx ecx, byte [rdx + rax]
+    cmp  ecx, 0xFF
+    je   .copy
+    mov  [fp_k], rcx
+    mov  qword [fp_saved], -1
+    mov  [pp_e2], r8
+    cmp  qword [fp_k], 0
+    je   .skipemit
+    mov  byte [fp_mode], 1
+    call fp_emit
+    jmp  .skipemit
+.copy:                          ; this line unchanged
+    mov  al, [r13]
+    mov  [r15], al
+    inc  r13
+    inc  r15
+    cmp  al, 10
+    je   .line
+    cmp  r13, r14
+    jb   .copy
+    jmp  .line
+.finish:
+    lea  rsi, [opt_buf]
+    mov  rcx, r15
+    sub  rcx, rsi
+    mov  [out_len], rcx
+    lea  rdi, [out_buf]
+    rep  movsb
+.abort:
+    ret
+
+; the inline save ([fp_mode] = 0) or restore (1) of [fp_k] qwords of the def [fp_n], appended to the output
+fp_emit:
+    cmp  byte [fp_mode], 0
+    jne  .rest
+    PP_PUT fp_s1a
+    mov  rax, [fp_k]
+    shl  rax, 3
+    call pp_put_dec
+    PP_PUT fp_s1b
+    mov  qword [fp_i], 0
+.sl:
+    mov  rax, [fp_i]
+    cmp  rax, [fp_k]
+    jae  .done
+    PP_PUT fp_s2a
+    mov  rax, [fp_n]
+    call pp_put_dec
+    PP_PUT fp_s2b
+    mov  rax, [fp_i]
+    shl  rax, 3
+    call pp_put_dec
+    PP_PUT fp_s2c
+    mov  rax, [fp_i]
+    shl  rax, 3
+    call pp_put_dec
+    PP_PUT fp_s2d
+    inc  qword [fp_i]
+    jmp  .sl
+.rest:
+    PP_PUT fp_r1a
+    mov  rax, [fp_k]
+    shl  rax, 3
+    call pp_put_dec
+    PP_PUT fp_r1b
+    mov  qword [fp_i], 0
+.rl:
+    mov  rax, [fp_i]
+    cmp  rax, [fp_k]
+    jae  .done
+    PP_PUT fp_r2a
+    mov  rax, [fp_i]
+    shl  rax, 3
+    call pp_put_dec
+    PP_PUT fp_r2b
+    mov  rax, [fp_n]
+    call pp_put_dec
+    PP_PUT fp_s2b
+    mov  rax, [fp_i]
+    shl  rax, 3
+    call pp_put_dec
+    PP_PUT fp_r2d
+    inc  qword [fp_i]
+    jmp  .rl
+.done:
     ret
 
 ; ---- emit primitives --------------------------------------------------------
